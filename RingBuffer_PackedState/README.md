@@ -184,3 +184,5 @@ Free to use, modify, and distribute under the MIT License, provided it is used s
 Requires either a written commercial license agreement with PxQ Technologies, or direct delivery by Erik Nørskov (PxQ Technologies) as part of a paid engagement or employment, in which case a license is granted for use within that specific project scope only.
 
 Contact: https://pxq.dk
+
+If you find this library useful, please consider giving it a ⭐ on [GitHub](https://github.com/pxq-dk/RingBuffer-Cortex) — it helps others discover it.
