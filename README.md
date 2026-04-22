@@ -4,6 +4,29 @@ A ring buffer optimised for ARM Cortex-M microcontrollers, designed around speci
 
 ---
 
+## Quick Start
+
+```cpp
+#include "RingBuffer_PackedState/RingBuffer_PackedState.h"
+
+// Basic use — no IRQ protection
+RingBuffer_PackedState<uint8_t, 32> rb;
+
+rb.push(42);
+
+uint8_t val;
+if (rb.pop(val)) {
+    // val == 42
+}
+
+// ISR-safe — PRIMASK save/restore, safe in both main context and ISR
+RingBuffer_PackedState<uint8_t, 32, IrqProtection> rb_isr;
+```
+
+See [`RingBuffer_PackedState`](RingBuffer_PackedState/) for the full API including DMA contiguous area access.
+
+---
+
 ## Available
 
 ### [`RingBuffer_PackedState`](RingBuffer_PackedState/)
