@@ -1,5 +1,7 @@
 # RingBuffer-Cortex
 
+[![GitHub stars](https://img.shields.io/github/stars/pxq-dk/RingBuffer-Cortex?style=social)](https://github.com/pxq-dk/RingBuffer-Cortex/stargazers)
+
 A ring buffer optimised for ARM Cortex-M microcontrollers, designed around specific performance trade-offs for embedded systems.
 
 ---
