@@ -26,6 +26,8 @@
 
 #pragma once
 
+inline constexpr const char* RINGBUFFER_PACKEDSTATE_VERSION = "1.0.0";
+
 #include <cstdint>
 #include <cstddef>
 #include <type_traits>
