@@ -1,5 +1,5 @@
 /*
- * RingBuffer_32bit.h
+ * RingBuffer_PackedState.h
  *
  *  Created on: 18. apr. 2026
  *      Author: Erik Nørskov
@@ -190,9 +190,9 @@ class unit_test_ringbuffer
 // One slot is sacrificed to distinguish full from empty without a count variable.
 // Effective capacity is Size-1.
 template<typename T, size_t Size, typename IrqPolicy = NoIrqProtection, bool _IsTestInstance = false>
-class RingBuffer_32Bit
+class RingBuffer_PackedState
 {
-	static_assert(Size >= 2 && Size <= 65535, "RingBuffer_32Bit: Size must be in range [2, 65535]");
+	static_assert(Size >= 2 && Size <= 65535, "RingBuffer_PackedState: Size must be in range [2, 65535]");
 
 	private:
 	struct Guard {
@@ -228,12 +228,12 @@ class RingBuffer_32Bit
 	using value_type = T;
 	static constexpr size_t capacity = Size - 1;
 
-	constexpr RingBuffer_32Bit() : state{0}, buffer{}
+	constexpr RingBuffer_PackedState() : state{0}, buffer{}
 	{
 		if constexpr (!_IsTestInstance)
 		{
-			using test_type = RingBuffer_32Bit<T, 4, NoIrqProtection, true>;
-			static_assert(unit_test_ringbuffer<test_type>::run_test(), "RingBuffer_32Bit unit test failed!");
+			using test_type = RingBuffer_PackedState<T, 4, NoIrqProtection, true>;
+			static_assert(unit_test_ringbuffer<test_type>::run_test(), "RingBuffer_PackedState unit test failed!");
 		}
 	}
 
