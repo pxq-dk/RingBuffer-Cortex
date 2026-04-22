@@ -38,18 +38,6 @@
 	#define RB_OPT_INLINE
 #endif
 
-// Template specialization trick: GCC emits [[deprecated]] warnings even inside
-// if constexpr (false) branches. Using a struct specialization fires the warning
-// at type instantiation level instead, which GCC handles correctly.
-namespace detail {
-	template<bool> struct NonPow2Checker {
-		static constexpr void check() {}
-	};
-	template<> struct NonPow2Checker<true> {
-		[[deprecated("RingBuffer_32Bit: Size is not a power of 2 — consider a power-of-2 size for optimal performance (suppress with WarnNonPow2=false)")]]
-		static constexpr void check() {}
-	};
-}
 
 struct NoIrqProtection {
 	static constexpr bool needs_volatile = false;
@@ -201,7 +189,7 @@ class unit_test_ringbuffer
 // atomic LDR/STR on Cortex-M. Head in low 16 bits, tail in high 16 bits.
 // One slot is sacrificed to distinguish full from empty without a count variable.
 // Effective capacity is Size-1.
-template<typename T, size_t Size, bool WarnNonPow2 = true, typename IrqPolicy = NoIrqProtection, bool _IsTestInstance = false>
+template<typename T, size_t Size, typename IrqPolicy = NoIrqProtection, bool _IsTestInstance = false>
 class RingBuffer_32Bit
 {
 	static_assert(Size >= 2 && Size <= 65535, "RingBuffer_32Bit: Size must be in range [2, 65535]");
@@ -242,11 +230,9 @@ class RingBuffer_32Bit
 
 	constexpr RingBuffer_32Bit() : state{0}, buffer{}
 	{
-		detail::NonPow2Checker<!is_power_of_two && WarnNonPow2>::check();
-
 		if constexpr (!_IsTestInstance)
 		{
-			using test_type = RingBuffer_32Bit<T, 4, true, NoIrqProtection, true>;
+			using test_type = RingBuffer_32Bit<T, 4, NoIrqProtection, true>;
 			static_assert(unit_test_ringbuffer<test_type>::run_test(), "RingBuffer_32Bit unit test failed!");
 		}
 	}
