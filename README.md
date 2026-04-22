@@ -153,6 +153,14 @@ RingBuffer_PackedState<uint8_t, 32, RtosProtection> rb;
 **Why packed `uint32_t` state?**
 On Cortex-M0+, a 32-bit aligned load (`LDR`) and store (`STR`) are atomic. Packing head and tail into a single `uint32_t` gives an atomic snapshot of both fields in one instruction, without needing a critical section for read-only operations like `isEmpty()`.
 
+**PackedState trade-off vs. split head/tail:**
+The packed approach has a cost on `push()` and `pop()`: even though `push()` only updates head and `pop()` only updates tail, both must perform a read-modify-write (`LDR` + `STR`) on the full 32-bit state to preserve the other field. A split design with separate head and tail variables would allow `push()` and `pop()` to each write only a single 4-byte variable (`STR` only).
+
+However, the packed approach wins on state queries: `isEmpty()`, `isFull()`, and `getCount()` read both indices in a single `LDR` instead of two separate reads.
+
+**When to prefer `RingBuffer_PackedState`:** polling the buffer state frequently (e.g. waiting for incoming data in a loop) — state queries are cheap.
+**When a split design would be faster:** very high `push()`/`pop()` throughput where the extra `LDR` per call is the bottleneck.
+
 **Why waste one slot?**
 Distinguishing full from empty without a separate count variable. If `head == tail` the buffer is empty; if `nextIndex(head) == tail` it is full. Simple, branchless, and correct.
 
