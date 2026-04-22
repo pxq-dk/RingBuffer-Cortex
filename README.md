@@ -9,7 +9,7 @@ ISR-safe, DMA-friendly ring buffer for ARM Cortex-M — atomic LDR/STR, policy-b
 - **Atomic state** — head and tail packed into a single `uint32_t` for atomic LDR/STR on Cortex-M0+. No separate counter variable.
 - **Policy-based IRQ protection** — choose `NoIrqProtection` or `IrqProtection` as a template argument. Zero overhead when protection is not needed.
 - **Conditional `volatile`** — `state` and `buffer` are automatically `volatile` when `IrqProtection` is used, ensuring the compiler never caches values across ISR boundaries.
-- **Power-of-2 optimization** — selects `& (Size-1)` over `% Size` at compile time via `if constexpr`. No software division on Cortex-M0+.
+- **No software division** — power-of-2 sizes use `& (Size-1)`; non-power-of-2 sizes use compare-and-subtract. Both avoid `__aeabi_uidivmod` on Cortex-M0+.
 - **DMA-friendly contiguous area API** — zero-copy access via `get_contiguous_push_area` / `get_contiguous_pop_area` for direct DMA transfers.
 - **Compile-time unit tests** — a `static_assert` in the constructor runs a full test suite at compile time. A broken instantiation will not compile.
 - **Header-only** — single `.h` file, no dependencies beyond the C++ standard library.
@@ -20,7 +20,7 @@ ISR-safe, DMA-friendly ring buffer for ARM Cortex-M — atomic LDR/STR, policy-b
 
 - C++17 or later
 - ARM Cortex-M target (GCC `arm-none-eabi`) or any C++17 compiler for host-side use
-- `__disable_irq()` / `__enable_irq()` available when using the built-in `IrqProtection` (standard CMSIS). Custom protection schemes (RTOS, custom critical sections) can be used by defining a custom policy — see IRQ Protection Policies.
+- `__disable_irq()`, `__get_PRIMASK()`, and `__set_PRIMASK()` available when using the built-in `IrqProtection` (standard CMSIS). Custom protection schemes (RTOS, custom critical sections) can be used by defining a custom policy — see IRQ Protection Policies.
 
 ---
 
@@ -44,7 +44,7 @@ if (rb.pop(val)) {
 ### ISR-safe — with IRQ protection
 
 ```cpp
-RingBuffer_32Bit<uint8_t, 32, true, IrqProtection> rb;
+RingBuffer_32Bit<uint8_t, 32, IrqProtection> rb;
 
 // Safe to call from both main context and ISR
 rb.push(42);
@@ -59,7 +59,7 @@ Two variants are available depending on when the head/tail index should advance.
 
 **Commit variant** — write/read first, then advance index:
 ```cpp
-RingBuffer_32Bit<uint8_t, 64, true, IrqProtection> rb;
+RingBuffer_32Bit<uint8_t, 64, IrqProtection> rb;
 
 // Get pointer and count for DMA write
 auto area = rb.get_contiguous_push_area(32);
@@ -96,7 +96,6 @@ auto out = rb.reserve_pop(32);    // tail advances immediately
 |---|---|---|
 | `T` | — | Element type |
 | `Size` | — | Total buffer slots. Effective capacity is `Size-1`. Must be in range [2, 65535]. |
-| `WarnNonPow2` | `true` | Emit a compiler warning if `Size` is not a power of 2 |
 | `IrqPolicy` | `NoIrqProtection` | IRQ protection policy. Use `IrqProtection` for ISR-safe operation. |
 
 ---
@@ -126,16 +125,16 @@ auto out = rb.reserve_pop(32);    // tail advances immediately
 | `NoIrqProtection` | `false` | Single context only, or already inside a critical section |
 | `IrqProtection` | `true` | Shared between main context and ISR |
 
-Custom policies are supported — implement `lock()`, `unlock()`, and `needs_volatile`. Example using FreeRTOS:
+Custom policies are supported — implement `needs_volatile`, `lock()` (returns `uint32_t` state), and `unlock(uint32_t)` (restores state). Example using FreeRTOS:
 
 ```cpp
 struct RtosProtection {
     static constexpr bool needs_volatile = true;
-    static void lock()   { taskENTER_CRITICAL(); }
-    static void unlock() { taskEXIT_CRITICAL(); }
+    static uint32_t lock()             { taskENTER_CRITICAL(); return 0; }
+    static void     unlock(uint32_t)   { taskEXIT_CRITICAL(); }
 };
 
-RingBuffer_32Bit<uint8_t, 32, true, RtosProtection> rb;
+RingBuffer_32Bit<uint8_t, 32, RtosProtection> rb;
 ```
 
 ---
@@ -143,8 +142,9 @@ RingBuffer_32Bit<uint8_t, 32, true, RtosProtection> rb;
 ## Performance (STM32G051, Cortex-M0+, `-Os`)
 
 - **`push` / `pop`**: ~13 instructions, no stack spills, no out-of-line calls
-- **`IrqProtection` overhead**: `CPSID` + `CPSIE` per call (~6–8 extra cycles)
-- **Power-of-2 size**: index wrapping uses a single `AND` instruction — no division
+- **`IrqProtection` overhead**: `MRS` + `CPSID` + `MSR` per call (~7–9 extra cycles); saves and restores PRIMASK for correct nesting
+- **Power-of-2 size**: index wrapping uses a single `AND` instruction (~2 cycles)
+- **Non-power-of-2 size**: index wrapping uses compare-and-subtract (~4 cycles) — no software division
 
 ---
 
