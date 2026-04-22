@@ -53,14 +53,14 @@ namespace detail {
 
 struct NoIrqProtection {
 	static constexpr bool needs_volatile = false;
-	static constexpr void lock()   {}
-	static constexpr void unlock() {}
+	static constexpr uint32_t lock()             { return 0; }
+	static constexpr void     unlock(uint32_t)   {}
 };
 
 struct IrqProtection {
 	static constexpr bool needs_volatile = true;
-	static void lock()   { __disable_irq(); }
-	static void unlock() { __enable_irq(); }
+	static uint32_t lock()             { uint32_t p = __get_PRIMASK(); __disable_irq(); return p; }
+	static void     unlock(uint32_t p) { __set_PRIMASK(p); }
 };
 
 template<typename RBType>
@@ -208,8 +208,9 @@ class RingBuffer_32Bit
 
 	private:
 	struct Guard {
-		constexpr Guard()  { IrqPolicy::lock(); }
-		constexpr ~Guard() { IrqPolicy::unlock(); }
+		uint32_t primask;
+		constexpr Guard()  : primask(IrqPolicy::lock()) {}
+		constexpr ~Guard() { IrqPolicy::unlock(primask); }
 	};
 
 	static constexpr bool is_power_of_two = (Size & (Size - 1)) == 0;
