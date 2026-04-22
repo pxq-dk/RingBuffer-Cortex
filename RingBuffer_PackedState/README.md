@@ -1,5 +1,7 @@
 # RingBuffer_PackedState
 
+[![GitHub stars](https://img.shields.io/github/stars/pxq-dk/RingBuffer-Cortex?style=social)](https://github.com/pxq-dk/RingBuffer-Cortex/stargazers)
+
 ISR-safe, DMA-friendly ring buffer for ARM Cortex-M — atomic LDR/STR, policy-based IRQ protection, compile-time unit tests.
 
 ---
