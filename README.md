@@ -1,4 +1,4 @@
-# RingBuffer_32Bit
+# RingBuffer_PackedState
 
 ISR-safe, DMA-friendly ring buffer for ARM Cortex-M — atomic LDR/STR, policy-based IRQ protection, compile-time unit tests.
 
@@ -29,9 +29,9 @@ ISR-safe, DMA-friendly ring buffer for ARM Cortex-M — atomic LDR/STR, policy-b
 ### Basic — no IRQ protection
 
 ```cpp
-#include "RingBuffer_32Bit.h"
+#include "RingBuffer_PackedState.h"
 
-RingBuffer_32Bit<uint8_t, 32> rb;
+RingBuffer_PackedState<uint8_t, 32> rb;
 
 rb.push(42);
 
@@ -44,7 +44,7 @@ if (rb.pop(val)) {
 ### ISR-safe — with IRQ protection
 
 ```cpp
-RingBuffer_32Bit<uint8_t, 32, IrqProtection> rb;
+RingBuffer_PackedState<uint8_t, 32, IrqProtection> rb;
 
 // Safe to call from both main context and ISR
 rb.push(42);
@@ -59,7 +59,7 @@ Two variants are available depending on when the head/tail index should advance.
 
 **Commit variant** — write/read first, then advance index:
 ```cpp
-RingBuffer_32Bit<uint8_t, 64, IrqProtection> rb;
+RingBuffer_PackedState<uint8_t, 64, IrqProtection> rb;
 
 // Get pointer and count for DMA write
 auto area = rb.get_contiguous_push_area(32);
@@ -134,7 +134,7 @@ struct RtosProtection {
     static void     unlock(uint32_t)   { taskEXIT_CRITICAL(); }
 };
 
-RingBuffer_32Bit<uint8_t, 32, RtosProtection> rb;
+RingBuffer_PackedState<uint8_t, 32, RtosProtection> rb;
 ```
 
 ---
