@@ -227,12 +227,12 @@ class RingBuffer_32Bit
 
 	RB_OPT_INLINE constexpr uint16_t nextIndex(uint16_t idx) const {
 		if constexpr (is_power_of_two) return (idx + 1) & static_cast<uint16_t>(Size - 1);
-		else                           return (idx + 1) % static_cast<uint16_t>(Size);
+		else                           return (idx + 1 >= static_cast<uint16_t>(Size)) ? static_cast<uint16_t>(0) : static_cast<uint16_t>(idx + 1);
 	}
 
 	RB_OPT_INLINE constexpr size_t wrapSize(uint32_t val) const {
 		if constexpr (is_power_of_two) return val & (Size - 1);
-		else                           return val % Size;
+		else                           return (val >= Size) ? val - Size : val;
 	}
 
 	public:
@@ -256,20 +256,20 @@ class RingBuffer_32Bit
 		uint16_t h      = getHead(s);
 		uint16_t t      = getTail(s);
 		uint16_t next_h = nextIndex(h);
-		if (next_h == t) return false;                  // full
+		if (next_h == t) return false;                   // full
 		buffer[h] = item;
-		state = pack(next_h, t);                        // single STR
+		state = pack(next_h, t);                         // single STR
 		return true;
 	}
 
 	RB_OPT_INLINE constexpr bool pop(T& item) {
 		Guard g;
-		uint32_t s = static_cast<uint32_t>(state);                             // single LDR
+		uint32_t s = static_cast<uint32_t>(state);       // single LDR
 		uint16_t h = getHead(s);
 		uint16_t t = getTail(s);
-		if (h == t) return false;                       // empty
+		if (h == t) return false;                         // empty
 		item  = buffer[t];
-		state = pack(h, nextIndex(t));                  // single STR
+		state = pack(h, nextIndex(t));                    // single STR
 		return true;
 	}
 
@@ -314,7 +314,7 @@ class RingBuffer_32Bit
 			h = static_cast<uint16_t>((h + count) & (Size - 1));
 		else
 			h = static_cast<uint16_t>((h + count) % Size);
-		state = pack(h, t);                                 // single STR
+		state = pack(h, t);                                  // single STR
 	}
 
 	// Returns pointer to tail and how many elements can be read contiguously
@@ -343,7 +343,7 @@ class RingBuffer_32Bit
 			t = static_cast<uint16_t>((t + count) & (Size - 1));
 		else
 			t = static_cast<uint16_t>((t + count) % Size);
-		state = pack(h, t);                                 // single STR
+		state = pack(h, t);                                  // single STR
 	}
 
 	// Reserves up to max_size contiguous push slots, advances head immediately,
@@ -362,7 +362,7 @@ class RingBuffer_32Bit
 			h = static_cast<uint16_t>((h + contiguous) & (Size - 1));
 		else
 			h = static_cast<uint16_t>((h + contiguous) % Size);
-		state = pack(h, t);                                 // single STR
+		state = pack(h, t);                                  // single STR
 		return { ptr, contiguous };
 	}
 
@@ -382,7 +382,7 @@ class RingBuffer_32Bit
 			t = static_cast<uint16_t>((t + contiguous) & (Size - 1));
 		else
 			t = static_cast<uint16_t>((t + contiguous) % Size);
-		state = pack(h, t);                                 // single STR
+		state = pack(h, t);                                  // single STR
 		return { ptr, contiguous };
 	}
 };
