@@ -55,3 +55,5 @@ Copyright (c) 2026 PxQ Technologies — https://pxq.dk
 **Commercial Use:** Requires a written commercial license agreement with PxQ Technologies, or direct delivery by Erik Nørskov (PxQ Technologies) as part of a paid engagement, in which case a license is granted for that specific project scope.
 
 Contact: https://pxq.dk
+
+If you find this library useful, please consider giving it a ⭐ on [GitHub](https://github.com/pxq-dk/RingBuffer-Cortex) — it helps others discover it.
