@@ -9,7 +9,7 @@ ISR-safe, DMA-friendly ring buffer for ARM Cortex-M — LDRH/STRH per field, pol
 ## Features
 
 - **Per-field halfword access** — head and tail are stored as adjacent `uint16_t` fields. Reads are `LDRH`, writes are `STRH`. Each side in SPSC touches only its own halfword with no read-modify-write of the other.
-- **Lock-free SPSC** — with `SpscProtection`, an ISR producer and a main-context consumer share the buffer without any IRQ masking. The ISR writes head (`STRH`), main writes tail (`STRH`) — the two stores never collide.
+- **Lock-free SPSC** — with `Topology::SPSC<>`, the producer writes head (`STRH`) and the consumer writes tail (`STRH`) without any IRQ masking. For example, an ISR pushes and main pops — or vice versa. The two stores target different halfword addresses and never collide.
 - **Policy-based IRQ protection** — choose `NoIrqProtection`, `SpscProtection`, or `IrqProtection` as a template argument. Zero overhead when protection is not needed.
 - **Conditional `volatile`** — `state` and `buffer` are automatically `volatile` when `needs_volatile` is true, ensuring the compiler always generates actual loads and stores across ISR boundaries.
 - **No software division** — power-of-2 sizes use `& (Size-1)`; non-power-of-2 sizes use compare-and-subtract. Both avoid `__aeabi_uidivmod` on Cortex-M0+.
@@ -47,23 +47,24 @@ if (rb.pop(val)) {
 ### ISR-safe — with IRQ protection
 
 ```cpp
-RingBuffer_PackedState<uint8_t, 32, IrqProtection<>::MPMC> rb;
+RingBuffer_PackedState<uint8_t, 32, Topology::MPMC> rb;
 
 // Safe to call from both main context and ISR
 rb.push(42);
 ```
 
-### Lock-free SPSC — ISR producer, main consumer
+### Lock-free SPSC — e.g. ISR producer, main consumer (or vice versa)
 
 ```cpp
 // SPSC: volatile fields (real LDRH/STRH) but no IRQ masking.
 // ISR owns head, main owns tail — their STRH writes never collide.
-RingBuffer_PackedState<uint8_t, 32, IrqProtection<>::SPSC> rb;
+// The roles can be reversed: main as producer, ISR as consumer.
+RingBuffer_PackedState<uint8_t, 32, Topology::SPSC<>> rb;
 
-// In ISR:
+// In ISR (producer):
 rb.push(byte_from_peripheral);
 
-// In main:
+// In main (consumer):
 uint8_t val;
 if (rb.pop(val)) {
     // process val
@@ -116,7 +117,7 @@ auto out = rb.reserve_pop(32);    // tail advances immediately
 |---|---|---|
 | `T` | — | Element type |
 | `Size` | — | Total buffer slots. Effective capacity is `Size-1`. Must be in range [2, 65535]. |
-| `IrqPolicy` | `IrqProtection<>::None` | IRQ protection policy. See IRQ Protection Policies below. |
+| `IrqPolicy` | `Topology::None` | IRQ protection policy. See IRQ Protection Policies below. |
 
 ---
 
@@ -142,19 +143,19 @@ auto out = rb.reserve_pop(32);    // tail advances immediately
 
 All built-in policies are nested types inside `IrqProtection`:
 
-All built-in policies use `PrimaskLock` by default. Pass a custom lock implementation as a template argument to `IrqProtection<>` to swap it out.
+All built-in topologies use `PrimaskLock` by default. Pass a custom lock implementation as a template argument to the chosen topology to swap it out.
 
 | Policy | `needs_volatile` | `lock_p_needed` | `lock_c_needed` | Use case |
 |---|---|---|---|---|
-| `IrqProtection<>::None` | `false` | `false` | `false` | Single context — no concurrency |
-| `IrqProtection<>::SPSC` | `true` | `false` | `false` | Lock-free SPSC — ISR owns head, main owns tail |
-| `IrqProtection<>::MPSC` | `true` | `true` | `false` | Multiple producers, single consumer — `push` guarded, `pop` free |
-| `IrqProtection<>::SPMC` | `true` | `false` | `true` | Single producer, multiple consumers — `pop` guarded, `push` free |
-| `IrqProtection<>::MPMC` | `true` | `true` | `true` | Multiple producers and consumers — both sides guarded |
+| `Topology::None` | `false` | `false` | `false` | Single context — no concurrency |
+| `Topology::SPSC` | `true` | `false` | `false` | Lock-free SPSC — e.g. ISR owns head, main owns tail (or vice versa) |
+| `Topology::MPSC` | `true` | `true` | `false` | Multiple producers, single consumer — `push` guarded, `pop` free |
+| `Topology::SPMC` | `true` | `false` | `true` | Single producer, multiple consumers — `pop` guarded, `push` free |
+| `Topology::MPMC` | `true` | `true` | `true` | Multiple producers and consumers — both sides guarded |
 
 `lock_p_needed` activates a `ProducerGuard` (PRIMASK save/restore) around `push`, `commit_push`, and `reserve_push`. `lock_c_needed` does the same for `pop`, `commit_pop`, and `reserve_pop`. This means `MPSC` pays no guard overhead on the consumer side, and `SPMC` pays none on the producer side.
 
-**Custom lock implementation** — define a struct with `lock()` / `unlock(uint32_t)` and pass it to `IrqProtection<>`. The topology flags are inherited from the chosen nested struct. Example using FreeRTOS:
+**Custom lock implementation** — define a struct with `lock()` / `unlock(uint32_t)` and pass it directly to the chosen topology. Example using FreeRTOS:
 
 ```cpp
 struct FreeRtosLock {
@@ -162,7 +163,7 @@ struct FreeRtosLock {
     static void     unlock(uint32_t) { taskEXIT_CRITICAL(); }
 };
 
-RingBuffer_PackedState<uint8_t, 32, IrqProtection<FreeRtosLock>::MPMC> rb;
+RingBuffer_PackedState<uint8_t, 32, Topology::MPMC<FreeRtosLock>> rb;
 ```
 
 ---
@@ -185,13 +186,13 @@ RingBuffer_PackedState<uint8_t, 32, IrqProtection<FreeRtosLock>::MPMC> rb;
 
 Storing head and tail as separate `uint16_t` fields in a 4-byte-aligned struct means each field is written with a single `STRH` instruction that touches only its own halfword. On Cortex-M0+, `STRH` to SRAM is not a read-modify-write — the bus writes exactly the addressed 16-bit location and leaves the adjacent halfword untouched.
 
-This makes SPSC lock-free: the ISR writes `state.head` (STRH at offset 0) while main writes `state.tail` (STRH at offset 2). The two stores target different bus addresses and cannot interfere, so no IRQ masking is needed.
+This makes SPSC lock-free: the ISR writes `state.head` (STRH at offset 0) while main writes `state.tail` (STRH at offset 2) — or vice versa. The two stores target different bus addresses and cannot interfere, so no IRQ masking is needed.
 
 An earlier version packed head and tail into a single `uint32_t` to give an atomic LDR snapshot of both fields. The trade-off: even though `push()` only changes head and `pop()` only changes tail, both had to do a full 32-bit read-modify-write (`LDR` + `STR`) to preserve the other field — which made lock-free SPSC impossible (a concurrent STR from the ISR could overwrite the stale field read by main).
 
-**Why `IrqProtection::SPSC` instead of `IrqProtection::None` for SPSC?**
+**Why `Topology::SPSC<>` instead of `Topology::None<>` for SPSC?**
 
-`IrqProtection::SPSC` sets `needs_volatile = true`, which makes `state.head` and `state.tail` `volatile`. Without `volatile`, the compiler is free to cache a field value in a register and never re-read it — ISR writes to `state.head` would be invisible to main. `volatile` forces an actual `LDRH` on every access, at no runtime cost beyond the instruction itself. The Guard is still a no-op, so there is no IRQ masking overhead.
+`Topology::SPSC<>` sets `needs_volatile = true`, which makes `state.head` and `state.tail` `volatile`. Without `volatile`, the compiler is free to cache a field value in a register and never re-read it — ISR writes to `state.head` would be invisible to main (or vice versa). `volatile` forces an actual `LDRH` on every access, at no runtime cost beyond the instruction itself. The Guard is still a no-op, so there is no IRQ masking overhead.
 
 **Why waste one slot?**
 Distinguishing full from empty without a separate count variable. If `head == tail` the buffer is empty; if `nextIndex(head) == tail` it is full. Simple, branchless, and correct.
