@@ -8,9 +8,9 @@ ISR-safe, DMA-friendly ring buffer for ARM Cortex-M — LDRH/STRH per field, pol
 
 ## Features
 
-- **Per-field halfword access** — head and tail are stored as adjacent `uint16_t` fields. Reads are `LDRH`, writes are `STRH`. Each side in SPSC touches only its own halfword with no read-modify-write of the other.
+- **Per-field halfword access** — head and tail are stored as adjacent `uint16_t` fields in a 4-byte-aligned struct. All state reads use a single 32-bit `LDR` atomic snapshot (`readHT()`). All state writes use individual `STRH` per field — no read-modify-write of the adjacent halfword.
 - **Lock-free SPSC** — with `Topology::SPSC<>`, the producer writes head (`STRH`) and the consumer writes tail (`STRH`) without any IRQ masking. For example, an ISR pushes and main pops — or vice versa. The two stores target different halfword addresses and never collide.
-- **Policy-based IRQ protection** — choose `NoIrqProtection`, `SpscProtection`, or `IrqProtection` as a template argument. Zero overhead when protection is not needed.
+- **Policy-based IRQ protection** — choose `Topology::None`, `Topology::SPSC`, `Topology::MPSC`, `Topology::SPMC`, or `Topology::MPMC` as a template argument. Zero overhead when protection is not needed.
 - **Conditional `volatile`** — `state` and `buffer` are automatically `volatile` when `needs_volatile` is true, ensuring the compiler always generates actual loads and stores across ISR boundaries.
 - **No software division** — power-of-2 sizes use `& (Size-1)`; non-power-of-2 sizes use compare-and-subtract. Both avoid `__aeabi_uidivmod` on Cortex-M0+.
 - **DMA-friendly contiguous area API** — zero-copy access via `get_contiguous_push_area` / `get_contiguous_pop_area` for direct DMA transfers.
@@ -21,8 +21,8 @@ ISR-safe, DMA-friendly ring buffer for ARM Cortex-M — LDRH/STRH per field, pol
 
 ## Requirements
 
-- C++17 or later
-- ARM Cortex-M target (GCC `arm-none-eabi`) or any C++17 compiler for host-side use
+- C++20 or later
+- ARM Cortex-M target (GCC `arm-none-eabi`) or any C++20 compiler for host-side use
 - `__disable_irq()`, `__get_PRIMASK()`, and `__set_PRIMASK()` available when using the built-in `IrqProtection` (standard CMSIS). Custom protection schemes (RTOS, custom critical sections) can be used by defining a custom policy — see IRQ Protection Policies.
 
 ---
@@ -127,9 +127,12 @@ auto out = rb.reserve_pop(32);    // tail advances immediately
 |---|---|
 | `push(item)` | Push item. Returns `false` if full. Guard-protected. |
 | `pop(item)` | Pop item. Returns `false` if empty. Guard-protected. |
+| `peek(item)` | Read next item without advancing tail. Returns `false` if empty. No guard needed. |
 | `isFull()` | Returns `true` if buffer is full. |
 | `isEmpty()` | Returns `true` if buffer is empty. |
 | `getCount()` | Returns number of elements currently in buffer. |
+
+> All functions use `readHT()` for their initial state read — a single 32-bit `LDR` atomic snapshot of head and tail, safe across ISR boundaries. Writes back to `state.head` or `state.tail` remain individual `STRH` instructions.
 | `get_contiguous_push_area(max)` | Returns pointer + count of contiguous writable slots. Call `commit_push()` after writing. |
 | `commit_push(count)` | Advances head by `count` after a contiguous push. Clamped to available space. |
 | `get_contiguous_pop_area(max)` | Returns pointer + count of contiguous readable slots. Call `commit_pop()` after reading. |
@@ -141,7 +144,7 @@ auto out = rb.reserve_pop(32);    // tail advances immediately
 
 ## IRQ Protection Policies
 
-All built-in policies are nested types inside `IrqProtection`:
+All built-in topologies are nested types inside `Topology`:
 
 All built-in topologies use `PrimaskLock` by default. Pass a custom lock implementation as a template argument to the chosen topology to swap it out.
 
@@ -171,10 +174,10 @@ RingBuffer_PackedState<uint8_t, 32, Topology::MPMC<FreeRtosLock>> rb;
 ## Performance (STM32G051, Cortex-M0+, `-Os`)
 
 - **`push` / `pop`**: ~12 instructions, no stack spills, no out-of-line calls
-- **`IrqProtection::SPSC` overhead**: none — no IRQ masking, `volatile` fields ensure actual LDRH/STRH
-- **`IrqProtection::MPSC`**: guard on `push` only (~7–9 cycles); `pop` is free
-- **`IrqProtection::SPMC`**: guard on `pop` only (~7–9 cycles); `push` is free
-- **`IrqProtection::MPMC` overhead**: `MRS` + `CPSID` + `MSR` on both `push` and `pop` (~7–9 extra cycles each)
+- **`Topology::SPSC` overhead**: none — no IRQ masking, `volatile` fields ensure actual LDRH/STRH
+- **`Topology::MPSC`**: guard on `push` only (~7–9 cycles); `pop` is free
+- **`Topology::SPMC`**: guard on `pop` only (~7–9 cycles); `push` is free
+- **`Topology::MPMC` overhead**: `MRS` + `CPSID` + `MSR` on both `push` and `pop` (~7–9 extra cycles each)
 - **Power-of-2 size**: index wrapping uses a single `AND` instruction (~2 cycles)
 - **Non-power-of-2 size**: index wrapping uses compare-and-subtract (~4 cycles) — no software division
 
@@ -188,7 +191,15 @@ Storing head and tail as separate `uint16_t` fields in a 4-byte-aligned struct m
 
 This makes SPSC lock-free: the ISR writes `state.head` (STRH at offset 0) while main writes `state.tail` (STRH at offset 2) — or vice versa. The two stores target different bus addresses and cannot interfere, so no IRQ masking is needed.
 
-An earlier version packed head and tail into a single `uint32_t` to give an atomic LDR snapshot of both fields. The trade-off: even though `push()` only changes head and `pop()` only changes tail, both had to do a full 32-bit read-modify-write (`LDR` + `STR`) to preserve the other field — which made lock-free SPSC impossible (a concurrent STR from the ISR could overwrite the stale field read by main).
+An earlier version packed head and tail into a single `uint32_t`. The problem: even though `push()` only changes head and `pop()` only changes tail, both had to do a full 32-bit read-modify-write (`LDR` + `STR`) to preserve the other field — which made lock-free SPSC impossible (a concurrent STR from the ISR could overwrite the stale field read by main).
+
+The current design gets the best of both: writes use individual `STRH` per field (no RMW, enabling SPSC), while reads use `readHT()` — a single 32-bit `LDR` via `reinterpret_cast` that atomically snapshots both fields in one bus transaction.
+
+**Why `readHT()` for all state reads?**
+
+All functions that inspect head and tail — `push`, `pop`, `peek`, `isEmpty`, `isFull`, `getCount`, and the contiguous area functions — call `readHT()`, which does a single 32-bit `LDR` from the 4-byte-aligned state struct. This gives a consistent snapshot of both fields from the same moment in time, safe across ISR boundaries. Without it, two separate `LDRH` reads could be split by an ISR and yield a head/tail pair that never existed simultaneously.
+
+At compile time (constexpr unit tests), `std::is_constant_evaluated()` switches `readHT()` to two separate field reads, since `reinterpret_cast` is not permitted in constant expressions.
 
 **Why `Topology::SPSC<>` instead of `Topology::None<>` for SPSC?**
 
