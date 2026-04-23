@@ -22,13 +22,13 @@ if (rb.pop(val)) {
 }
 
 // ISR-safe — PRIMASK save/restore, multiple producers/consumers
-RingBuffer_PackedState<uint8_t, 32, IrqProtection<>::MPMC> rb_mpmc;
+RingBuffer_PackedState<uint8_t, 32, Topology::MPMC> rb_mpmc;
 
-// Lock-free SPSC — ISR writes head, main reads tail, no IRQ masking needed
-RingBuffer_PackedState<uint8_t, 32, IrqProtection<>::SPSC> rb_spsc;
+// Lock-free SPSC — e.g. ISR producer + main consumer, or vice versa, no IRQ masking needed
+RingBuffer_PackedState<uint8_t, 32, Topology::SPSC<>> rb_spsc;
 
 // Custom lock — e.g. FreeRTOS critical section
-RingBuffer_PackedState<uint8_t, 32, IrqProtection<FreeRtosLock>::MPMC> rb_rtos;
+RingBuffer_PackedState<uint8_t, 32, Topology::MPMC<FreeRtosLock>> rb_rtos;
 ```
 
 See [`RingBuffer_PackedState`](RingBuffer_PackedState/) for the full API including DMA contiguous area access.
@@ -45,7 +45,7 @@ ISR-safe, DMA-friendly ring buffer for ARM Cortex-M. Head and tail stored as adj
 
 ## Features
 
-- **Policy-based IRQ protection** — `IrqProtection<>::None` / `SPSC` / `MPSC` / `SPMC` / `MPMC`; producer and consumer guards are independent, so MPSC pays no overhead on `pop` and SPMC pays none on `push`; swap `PrimaskLock` for any custom lock (e.g. FreeRTOS) via `IrqProtection<FreeRtosLock>::MPMC`
+- **Topology-based policy** — `Topology::None<>` / `SPSC<>` / `MPSC<>` / `SPMC<>` / `MPMC<>`; producer and consumer guards are independent, so MPSC pays no overhead on `pop` and SPMC pays none on `push`; swap `PrimaskLock` for any custom lock (e.g. FreeRTOS) via `Topology::MPMC<FreeRtosLock>`
 - **Compile-time unit tests** — a `static_assert` in the constructor verifies correctness at build time
 - **Header-only** — single `.h` file per implementation, no dependencies beyond the C++ standard library
 - **C++17** or later required
