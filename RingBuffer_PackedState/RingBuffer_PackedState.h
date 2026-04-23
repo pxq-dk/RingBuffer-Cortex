@@ -41,24 +41,48 @@ inline constexpr const char* RINGBUFFER_PACKEDSTATE_VERSION = "1.1.0";
 #endif
 
 
-struct NoIrqProtection {
-	static constexpr bool needs_volatile = false;
-	static constexpr uint32_t lock()             { return 0; }
-	static constexpr void     unlock(uint32_t)   {}
-};
-
-struct IrqProtection {
-	static constexpr bool needs_volatile = true;
+struct PrimaskLock {
 	static uint32_t lock()             { uint32_t p = __get_PRIMASK(); __disable_irq(); return p; }
 	static void     unlock(uint32_t p) { __set_PRIMASK(p); }
 };
 
-// Volatile fields (fresh LDRH/STRH) but no IRQ masking — correct for SPSC where
-// the ISR owns head and main owns tail, so their STRH writes never collide.
-struct SpscProtection {
-	static constexpr bool needs_volatile = true;
-	static constexpr uint32_t lock()           { return 0; }
-	static constexpr void     unlock(uint32_t) {}
+template<typename LockImpl = PrimaskLock>
+struct IrqProtection {
+	// Single context — no concurrency at all.
+	struct None : LockImpl {
+		static constexpr bool needs_volatile = false;
+		static constexpr bool lock_p_needed  = false;
+		static constexpr bool lock_c_needed  = false;
+	};
+
+	// Single Producer, Single Consumer — ISR owns head, main owns tail.
+	// No guard on either side; volatile ensures actual LDRH/STRH on every access.
+	struct SPSC : LockImpl {
+		static constexpr bool needs_volatile = true;
+		static constexpr bool lock_p_needed  = false;
+		static constexpr bool lock_c_needed  = false;
+	};
+
+	// Multiple Producers, Single Consumer — producer side guarded, consumer side free.
+	struct MPSC : LockImpl {
+		static constexpr bool needs_volatile = true;
+		static constexpr bool lock_p_needed  = true;
+		static constexpr bool lock_c_needed  = false;
+	};
+
+	// Single Producer, Multiple Consumers — consumer side guarded, producer side free.
+	struct SPMC : LockImpl {
+		static constexpr bool needs_volatile = true;
+		static constexpr bool lock_p_needed  = false;
+		static constexpr bool lock_c_needed  = true;
+	};
+
+	// Multiple Producers, Multiple Consumers — both sides guarded.
+	struct MPMC : LockImpl {
+		static constexpr bool needs_volatile = true;
+		static constexpr bool lock_p_needed  = true;
+		static constexpr bool lock_c_needed  = true;
+	};
 };
 
 template<typename RBType>
@@ -199,17 +223,24 @@ class unit_test_ringbuffer
 // Reads are LDRH, writes are STRH — in SPSC each side owns one field exclusively.
 // One slot is sacrificed to distinguish full from empty without a count variable.
 // Effective capacity is Size-1.
-template<typename T, size_t Size, typename IrqPolicy = NoIrqProtection, bool _IsTestInstance = false>
+template<typename T, size_t Size, typename IrqPolicy = IrqProtection<>::None, bool _IsTestInstance = false>
 class RingBuffer_PackedState
 {
 	static_assert(Size >= 2 && Size <= 65535, "RingBuffer_PackedState: Size must be in range [2, 65535]");
 
 	private:
-	struct Guard {
+	template<bool Active>
+	struct GuardImpl {
 		uint32_t primask;
-		constexpr Guard()  : primask(IrqPolicy::lock()) {}
-		constexpr ~Guard() { IrqPolicy::unlock(primask); }
+		static constexpr uint32_t do_lock() {
+			if constexpr (Active) return IrqPolicy::lock();
+			else return 0;
+		}
+		constexpr GuardImpl()  : primask(do_lock()) {}
+		constexpr ~GuardImpl() { if constexpr (Active) IrqPolicy::unlock(primask); }
 	};
+	using ProducerGuard = GuardImpl<IrqPolicy::lock_p_needed>;
+	using ConsumerGuard = GuardImpl<IrqPolicy::lock_c_needed>;
 
 	static constexpr bool is_power_of_two = (Size & (Size - 1)) == 0;
 
@@ -238,13 +269,13 @@ class RingBuffer_PackedState
 	{
 		if constexpr (!_IsTestInstance)
 		{
-			using test_type = RingBuffer_PackedState<T, 4, NoIrqProtection, true>;
+			using test_type = RingBuffer_PackedState<T, 4, IrqProtection<>::None, true>;
 			static_assert(unit_test_ringbuffer<test_type>::run_test(), "RingBuffer_PackedState unit test failed!");
 		}
 	}
 
 	RB_OPT_INLINE constexpr bool push(const T& item) {
-		Guard g;
+		ProducerGuard g;
 		uint16_t h      = state.head;
 		uint16_t t      = state.tail;
 		uint16_t next_h = nextIndex(h);
@@ -255,7 +286,7 @@ class RingBuffer_PackedState
 	}
 
 	RB_OPT_INLINE constexpr bool pop(T& item) {
-		Guard g;
+		ConsumerGuard g;
 		uint16_t h = state.head;
 		uint16_t t = state.tail;
 		if (h == t) return false;                         // empty
@@ -293,7 +324,7 @@ class RingBuffer_PackedState
 
 	// Advances head by count after a contiguous push
 	RB_OPT constexpr void commit_push(size_t count) {
-		Guard g;
+		ProducerGuard g;
 		uint16_t h = state.head;
 		uint16_t t = state.tail;
 		size_t   available = wrapSize((uint32_t)t + Size - (uint32_t)h - 1);
@@ -320,7 +351,7 @@ class RingBuffer_PackedState
 
 	// Advances tail by count after a contiguous pop
 	RB_OPT constexpr void commit_pop(size_t count) {
-		Guard g;
+		ConsumerGuard g;
 		uint16_t h = state.head;
 		uint16_t t = state.tail;
 		size_t   available = wrapSize((uint32_t)h - (uint32_t)t + Size);
@@ -335,7 +366,7 @@ class RingBuffer_PackedState
 	// Reserves up to max_size contiguous push slots, advances head immediately,
 	// and returns pointer + count. Write to ptr after the call — no commit needed.
 	RB_OPT constexpr ContiguousArea reserve_push(size_t max_size) {
-		Guard g;
+		ProducerGuard g;
 		uint16_t h = state.head;
 		uint16_t t = state.tail;
 		size_t   available  = wrapSize((uint32_t)t + Size - (uint32_t)h - 1);
@@ -354,7 +385,7 @@ class RingBuffer_PackedState
 	// Reserves up to max_size contiguous pop slots, advances tail immediately,
 	// and returns pointer + count. Read from ptr after the call — no commit needed.
 	RB_OPT constexpr ConstContiguousArea reserve_pop(size_t max_size) {
-		Guard g;
+		ConsumerGuard g;
 		uint16_t h = state.head;
 		uint16_t t = state.tail;
 		size_t   available  = wrapSize((uint32_t)h - (uint32_t)t + Size);
