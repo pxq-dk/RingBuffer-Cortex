@@ -48,7 +48,7 @@ ISR-safe, DMA-friendly ring buffer for ARM Cortex-M. Head and tail stored as adj
 - **Topology-based policy** — `Topology::None<>` / `SPSC<>` / `MPSC<>` / `SPMC<>` / `MPMC<>`; producer and consumer guards are independent, so MPSC pays no overhead on `pop` and SPMC pays none on `push`; swap `PrimaskLock` for any custom lock (e.g. FreeRTOS) via `Topology::MPMC<FreeRtosLock>`
 - **Compile-time unit tests** — a `static_assert` in the constructor verifies correctness at build time
 - **Header-only** — single `.h` file per implementation, no dependencies beyond the C++ standard library
-- **C++17** or later required
+- **C++20** or later required
 
 ---
 
