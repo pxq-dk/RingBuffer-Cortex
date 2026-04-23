@@ -2,15 +2,16 @@
 
 [![GitHub stars](https://img.shields.io/github/stars/pxq-dk/RingBuffer-Cortex?style=social)](https://github.com/pxq-dk/RingBuffer-Cortex/stargazers)
 
-ISR-safe, DMA-friendly ring buffer for ARM Cortex-M — atomic LDR/STR, policy-based IRQ protection, compile-time unit tests.
+ISR-safe, DMA-friendly ring buffer for ARM Cortex-M — LDRH/STRH per field, policy-based IRQ protection, lock-free SPSC, compile-time unit tests.
 
 ---
 
 ## Features
 
-- **Atomic state** — head and tail packed into a single `uint32_t` for atomic LDR/STR on Cortex-M0+. No separate counter variable.
-- **Policy-based IRQ protection** — choose `NoIrqProtection` or `IrqProtection` as a template argument. Zero overhead when protection is not needed.
-- **Conditional `volatile`** — `state` and `buffer` are automatically `volatile` when `IrqProtection` is used, ensuring the compiler never caches values across ISR boundaries.
+- **Per-field halfword access** — head and tail are stored as adjacent `uint16_t` fields. Reads are `LDRH`, writes are `STRH`. Each side in SPSC touches only its own halfword with no read-modify-write of the other.
+- **Lock-free SPSC** — with `SpscProtection`, an ISR producer and a main-context consumer share the buffer without any IRQ masking. The ISR writes head (`STRH`), main writes tail (`STRH`) — the two stores never collide.
+- **Policy-based IRQ protection** — choose `NoIrqProtection`, `SpscProtection`, or `IrqProtection` as a template argument. Zero overhead when protection is not needed.
+- **Conditional `volatile`** — `state` and `buffer` are automatically `volatile` when `needs_volatile` is true, ensuring the compiler always generates actual loads and stores across ISR boundaries.
 - **No software division** — power-of-2 sizes use `& (Size-1)`; non-power-of-2 sizes use compare-and-subtract. Both avoid `__aeabi_uidivmod` on Cortex-M0+.
 - **DMA-friendly contiguous area API** — zero-copy access via `get_contiguous_push_area` / `get_contiguous_pop_area` for direct DMA transfers.
 - **Compile-time unit tests** — a `static_assert` in the constructor runs a full test suite at compile time. A broken instantiation will not compile.
@@ -50,6 +51,23 @@ RingBuffer_PackedState<uint8_t, 32, IrqProtection> rb;
 
 // Safe to call from both main context and ISR
 rb.push(42);
+```
+
+### Lock-free SPSC — ISR producer, main consumer
+
+```cpp
+// SpscProtection: volatile fields (real LDRH/STRH) but no IRQ masking.
+// ISR owns head, main owns tail — their STRH writes never collide.
+RingBuffer_PackedState<uint8_t, 32, SpscProtection> rb;
+
+// In ISR:
+rb.push(byte_from_peripheral);
+
+// In main:
+uint8_t val;
+if (rb.pop(val)) {
+    // process val
+}
 ```
 
 ### DMA — contiguous area API
@@ -98,7 +116,7 @@ auto out = rb.reserve_pop(32);    // tail advances immediately
 |---|---|---|
 | `T` | — | Element type |
 | `Size` | — | Total buffer slots. Effective capacity is `Size-1`. Must be in range [2, 65535]. |
-| `IrqPolicy` | `NoIrqProtection` | IRQ protection policy. Use `IrqProtection` for ISR-safe operation. |
+| `IrqPolicy` | `NoIrqProtection` | IRQ protection policy. See IRQ Protection Policies below. |
 
 ---
 
@@ -122,10 +140,11 @@ auto out = rb.reserve_pop(32);    // tail advances immediately
 
 ## IRQ Protection Policies
 
-| Policy | `needs_volatile` | Use case |
-|---|---|---|
-| `NoIrqProtection` | `false` | Single context only, or already inside a critical section |
-| `IrqProtection` | `true` | Shared between main context and ISR |
+| Policy | `needs_volatile` | Guard overhead | Use case |
+|---|---|---|---|
+| `NoIrqProtection` | `false` | none | Single context only, or already inside a critical section |
+| `SpscProtection` | `true` | none | Lock-free SPSC — ISR owns head, main owns tail |
+| `IrqProtection` | `true` | MRS + CPSID + MSR | Shared between multiple producers or consumers |
 
 Custom policies are supported — implement `needs_volatile`, `lock()` (returns `uint32_t` state), and `unlock(uint32_t)` (restores state). Example using FreeRTOS:
 
@@ -143,7 +162,8 @@ RingBuffer_PackedState<uint8_t, 32, RtosProtection> rb;
 
 ## Performance (STM32G051, Cortex-M0+, `-Os`)
 
-- **`push` / `pop`**: ~13 instructions, no stack spills, no out-of-line calls
+- **`push` / `pop`**: ~12 instructions, no stack spills, no out-of-line calls
+- **`SpscProtection` overhead**: none — no IRQ masking, `volatile` fields ensure actual LDRH/STRH
 - **`IrqProtection` overhead**: `MRS` + `CPSID` + `MSR` per call (~7–9 extra cycles); saves and restores PRIMASK for correct nesting
 - **Power-of-2 size**: index wrapping uses a single `AND` instruction (~2 cycles)
 - **Non-power-of-2 size**: index wrapping uses compare-and-subtract (~4 cycles) — no software division
@@ -152,18 +172,17 @@ RingBuffer_PackedState<uint8_t, 32, RtosProtection> rb;
 
 ## Design Notes
 
-**Why packed `uint32_t` state?**
-On Cortex-M0+, a 32-bit aligned load (`LDR`) and store (`STR`) are atomic. Packing head and tail into a single `uint32_t` gives an atomic snapshot of both fields in one instruction, without needing a critical section for read-only operations like `isEmpty()`.
+**Why adjacent `uint16_t` fields instead of a packed `uint32_t`?**
 
-**PackedState trade-off vs. split head/tail:**
-The packed approach has a cost on `push()` and `pop()`: even though `push()` only updates head and `pop()` only updates tail, both must perform a read-modify-write (`LDR` + `STR`) on the full 32-bit state to preserve the other field. A split design with separate head and tail variables would allow `push()` and `pop()` to each write only a single 4-byte variable (`STR` only) — saving 1 cycle per call.
+Storing head and tail as separate `uint16_t` fields in a 4-byte-aligned struct means each field is written with a single `STRH` instruction that touches only its own halfword. On Cortex-M0+, `STRH` to SRAM is not a read-modify-write — the bus writes exactly the addressed 16-bit location and leaves the adjacent halfword untouched.
 
-However, the packed approach wins on state queries: `isEmpty()`, `isFull()`, and `getCount()` read both indices in a single `LDR` (1 cycle, 1 bus transaction) instead of two separate reads (2 cycles, 2 bus transactions).
+This makes SPSC lock-free: the ISR writes `state.head` (STRH at offset 0) while main writes `state.tail` (STRH at offset 2). The two stores target different bus addresses and cannot interfere, so no IRQ masking is needed.
 
-On Cortex-M0+ the CPU and DMA share the same AHB bus. Halving the number of bus transactions for state queries directly reduces contention with DMA transfers — giving DMA more bandwidth under heavy load. This makes `RingBuffer_PackedState` particularly well suited to DMA-heavy systems where the buffer state is polled frequently.
+An earlier version packed head and tail into a single `uint32_t` to give an atomic LDR snapshot of both fields. The trade-off: even though `push()` only changes head and `pop()` only changes tail, both had to do a full 32-bit read-modify-write (`LDR` + `STR`) to preserve the other field — which made lock-free SPSC impossible (a concurrent STR from the ISR could overwrite the stale field read by main).
 
-**When to prefer `RingBuffer_PackedState`:** polling the buffer state frequently (e.g. waiting for incoming data in a loop), or when DMA is running in the background and bus bandwidth matters.
-**When a split design would be faster:** very high `push()`/`pop()` throughput where saving 1 cycle and 1 bus transaction per call outweighs the cost of 1 extra bus transaction on state queries.
+**Why `SpscProtection` instead of `NoIrqProtection` for SPSC?**
+
+`SpscProtection` sets `needs_volatile = true`, which makes `state.head` and `state.tail` `volatile`. Without `volatile`, the compiler is free to cache a field value in a register and never re-read it — ISR writes to `state.head` would be invisible to main. `volatile` forces an actual `LDRH` on every access, at no runtime cost beyond the instruction itself. The Guard is still a no-op, so there is no IRQ masking overhead.
 
 **Why waste one slot?**
 Distinguishing full from empty without a separate count variable. If `head == tail` the buffer is empty; if `nextIndex(head) == tail` it is full. Simple, branchless, and correct.
