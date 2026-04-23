@@ -34,7 +34,7 @@ ISR-safe, DMA-friendly ring buffer for ARM Cortex-M — LDRH/STRH per field, pol
 ```cpp
 #include "RingBuffer_PackedState.h"
 
-RingBuffer_PackedState<uint8_t, 32> rb;
+RingBuffer_PackedState<uint8_t, 32> rb;  // defaults to IrqProtection::None
 
 rb.push(42);
 
@@ -47,7 +47,7 @@ if (rb.pop(val)) {
 ### ISR-safe — with IRQ protection
 
 ```cpp
-RingBuffer_PackedState<uint8_t, 32, IrqProtection> rb;
+RingBuffer_PackedState<uint8_t, 32, IrqProtection<>::MPMC> rb;
 
 // Safe to call from both main context and ISR
 rb.push(42);
@@ -56,9 +56,9 @@ rb.push(42);
 ### Lock-free SPSC — ISR producer, main consumer
 
 ```cpp
-// SpscProtection: volatile fields (real LDRH/STRH) but no IRQ masking.
+// SPSC: volatile fields (real LDRH/STRH) but no IRQ masking.
 // ISR owns head, main owns tail — their STRH writes never collide.
-RingBuffer_PackedState<uint8_t, 32, SpscProtection> rb;
+RingBuffer_PackedState<uint8_t, 32, IrqProtection<>::SPSC> rb;
 
 // In ISR:
 rb.push(byte_from_peripheral);
@@ -116,7 +116,7 @@ auto out = rb.reserve_pop(32);    // tail advances immediately
 |---|---|---|
 | `T` | — | Element type |
 | `Size` | — | Total buffer slots. Effective capacity is `Size-1`. Must be in range [2, 65535]. |
-| `IrqPolicy` | `NoIrqProtection` | IRQ protection policy. See IRQ Protection Policies below. |
+| `IrqPolicy` | `IrqProtection<>::None` | IRQ protection policy. See IRQ Protection Policies below. |
 
 ---
 
@@ -140,22 +140,29 @@ auto out = rb.reserve_pop(32);    // tail advances immediately
 
 ## IRQ Protection Policies
 
-| Policy | `needs_volatile` | Guard overhead | Use case |
-|---|---|---|---|
-| `NoIrqProtection` | `false` | none | Single context only, or already inside a critical section |
-| `SpscProtection` | `true` | none | Lock-free SPSC — ISR owns head, main owns tail |
-| `IrqProtection` | `true` | MRS + CPSID + MSR | Shared between multiple producers or consumers |
+All built-in policies are nested types inside `IrqProtection`:
 
-Custom policies are supported — implement `needs_volatile`, `lock()` (returns `uint32_t` state), and `unlock(uint32_t)` (restores state). Example using FreeRTOS:
+All built-in policies use `PrimaskLock` by default. Pass a custom lock implementation as a template argument to `IrqProtection<>` to swap it out.
+
+| Policy | `needs_volatile` | `lock_p_needed` | `lock_c_needed` | Use case |
+|---|---|---|---|---|
+| `IrqProtection<>::None` | `false` | `false` | `false` | Single context — no concurrency |
+| `IrqProtection<>::SPSC` | `true` | `false` | `false` | Lock-free SPSC — ISR owns head, main owns tail |
+| `IrqProtection<>::MPSC` | `true` | `true` | `false` | Multiple producers, single consumer — `push` guarded, `pop` free |
+| `IrqProtection<>::SPMC` | `true` | `false` | `true` | Single producer, multiple consumers — `pop` guarded, `push` free |
+| `IrqProtection<>::MPMC` | `true` | `true` | `true` | Multiple producers and consumers — both sides guarded |
+
+`lock_p_needed` activates a `ProducerGuard` (PRIMASK save/restore) around `push`, `commit_push`, and `reserve_push`. `lock_c_needed` does the same for `pop`, `commit_pop`, and `reserve_pop`. This means `MPSC` pays no guard overhead on the consumer side, and `SPMC` pays none on the producer side.
+
+**Custom lock implementation** — define a struct with `lock()` / `unlock(uint32_t)` and pass it to `IrqProtection<>`. The topology flags are inherited from the chosen nested struct. Example using FreeRTOS:
 
 ```cpp
-struct RtosProtection {
-    static constexpr bool needs_volatile = true;
-    static uint32_t lock()             { taskENTER_CRITICAL(); return 0; }
-    static void     unlock(uint32_t)   { taskEXIT_CRITICAL(); }
+struct FreeRtosLock {
+    static uint32_t lock()           { taskENTER_CRITICAL(); return 0; }
+    static void     unlock(uint32_t) { taskEXIT_CRITICAL(); }
 };
 
-RingBuffer_PackedState<uint8_t, 32, RtosProtection> rb;
+RingBuffer_PackedState<uint8_t, 32, IrqProtection<FreeRtosLock>::MPMC> rb;
 ```
 
 ---
@@ -163,8 +170,10 @@ RingBuffer_PackedState<uint8_t, 32, RtosProtection> rb;
 ## Performance (STM32G051, Cortex-M0+, `-Os`)
 
 - **`push` / `pop`**: ~12 instructions, no stack spills, no out-of-line calls
-- **`SpscProtection` overhead**: none — no IRQ masking, `volatile` fields ensure actual LDRH/STRH
-- **`IrqProtection` overhead**: `MRS` + `CPSID` + `MSR` per call (~7–9 extra cycles); saves and restores PRIMASK for correct nesting
+- **`IrqProtection::SPSC` overhead**: none — no IRQ masking, `volatile` fields ensure actual LDRH/STRH
+- **`IrqProtection::MPSC`**: guard on `push` only (~7–9 cycles); `pop` is free
+- **`IrqProtection::SPMC`**: guard on `pop` only (~7–9 cycles); `push` is free
+- **`IrqProtection::MPMC` overhead**: `MRS` + `CPSID` + `MSR` on both `push` and `pop` (~7–9 extra cycles each)
 - **Power-of-2 size**: index wrapping uses a single `AND` instruction (~2 cycles)
 - **Non-power-of-2 size**: index wrapping uses compare-and-subtract (~4 cycles) — no software division
 
@@ -180,9 +189,9 @@ This makes SPSC lock-free: the ISR writes `state.head` (STRH at offset 0) while 
 
 An earlier version packed head and tail into a single `uint32_t` to give an atomic LDR snapshot of both fields. The trade-off: even though `push()` only changes head and `pop()` only changes tail, both had to do a full 32-bit read-modify-write (`LDR` + `STR`) to preserve the other field — which made lock-free SPSC impossible (a concurrent STR from the ISR could overwrite the stale field read by main).
 
-**Why `SpscProtection` instead of `NoIrqProtection` for SPSC?**
+**Why `IrqProtection::SPSC` instead of `IrqProtection::None` for SPSC?**
 
-`SpscProtection` sets `needs_volatile = true`, which makes `state.head` and `state.tail` `volatile`. Without `volatile`, the compiler is free to cache a field value in a register and never re-read it — ISR writes to `state.head` would be invisible to main. `volatile` forces an actual `LDRH` on every access, at no runtime cost beyond the instruction itself. The Guard is still a no-op, so there is no IRQ masking overhead.
+`IrqProtection::SPSC` sets `needs_volatile = true`, which makes `state.head` and `state.tail` `volatile`. Without `volatile`, the compiler is free to cache a field value in a register and never re-read it — ISR writes to `state.head` would be invisible to main. `volatile` forces an actual `LDRH` on every access, at no runtime cost beyond the instruction itself. The Guard is still a no-op, so there is no IRQ masking overhead.
 
 **Why waste one slot?**
 Distinguishing full from empty without a separate count variable. If `head == tail` the buffer is empty; if `nextIndex(head) == tail` it is full. Simple, branchless, and correct.
