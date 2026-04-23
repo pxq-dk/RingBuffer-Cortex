@@ -2,7 +2,7 @@
 
 [![GitHub stars](https://img.shields.io/github/stars/pxq-dk/RingBuffer-Cortex?style=social)](https://github.com/pxq-dk/RingBuffer-Cortex/stargazers)
 
-A ring buffer optimised for ARM Cortex-M microcontrollers, designed around specific performance trade-offs for embedded systems.
+A ring buffer optimised for ARM Cortex-M microcontrollers, with lock-free SPSC support and policy-based IRQ protection.
 
 ---
 
@@ -23,6 +23,9 @@ if (rb.pop(val)) {
 
 // ISR-safe — PRIMASK save/restore, safe in both main context and ISR
 RingBuffer_PackedState<uint8_t, 32, IrqProtection> rb_isr;
+
+// Lock-free SPSC — ISR writes head, main reads tail, no IRQ masking needed
+RingBuffer_PackedState<uint8_t, 32, SpscProtection> rb_spsc;
 ```
 
 See [`RingBuffer_PackedState`](RingBuffer_PackedState/) for the full API including DMA contiguous area access.
@@ -33,13 +36,13 @@ See [`RingBuffer_PackedState`](RingBuffer_PackedState/) for the full API includi
 
 ### [`RingBuffer_PackedState`](RingBuffer_PackedState/)
 
-ISR-safe, DMA-friendly ring buffer for ARM Cortex-M. Head and tail packed into a single `uint32_t` for atomic LDR/STR and minimal bus transactions. Best suited for systems that poll buffer state frequently or run heavy DMA in the background.
+ISR-safe, DMA-friendly ring buffer for ARM Cortex-M. Head and tail stored as adjacent `uint16_t` fields — reads are `LDRH`, writes are `STRH`. Each side in SPSC owns one field exclusively, enabling lock-free operation without IRQ masking.
 
 ---
 
 ## Features
 
-- **Policy-based IRQ protection** — `NoIrqProtection` or `IrqProtection` (PRIMASK save/restore, safe in both ISR and non-ISR contexts)
+- **Policy-based IRQ protection** — `NoIrqProtection`, `SpscProtection` (lock-free SPSC, no masking), or `IrqProtection` (PRIMASK save/restore, safe in both ISR and non-ISR contexts)
 - **Compile-time unit tests** — a `static_assert` in the constructor verifies correctness at build time
 - **Header-only** — single `.h` file per implementation, no dependencies beyond the C++ standard library
 - **C++17** or later required
