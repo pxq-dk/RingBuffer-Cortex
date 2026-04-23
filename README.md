@@ -21,11 +21,14 @@ if (rb.pop(val)) {
     // val == 42
 }
 
-// ISR-safe — PRIMASK save/restore, safe in both main context and ISR
-RingBuffer_PackedState<uint8_t, 32, IrqProtection> rb_isr;
+// ISR-safe — PRIMASK save/restore, multiple producers/consumers
+RingBuffer_PackedState<uint8_t, 32, IrqProtection<>::MPMC> rb_mpmc;
 
 // Lock-free SPSC — ISR writes head, main reads tail, no IRQ masking needed
-RingBuffer_PackedState<uint8_t, 32, SpscProtection> rb_spsc;
+RingBuffer_PackedState<uint8_t, 32, IrqProtection<>::SPSC> rb_spsc;
+
+// Custom lock — e.g. FreeRTOS critical section
+RingBuffer_PackedState<uint8_t, 32, IrqProtection<FreeRtosLock>::MPMC> rb_rtos;
 ```
 
 See [`RingBuffer_PackedState`](RingBuffer_PackedState/) for the full API including DMA contiguous area access.
@@ -42,7 +45,7 @@ ISR-safe, DMA-friendly ring buffer for ARM Cortex-M. Head and tail stored as adj
 
 ## Features
 
-- **Policy-based IRQ protection** — `NoIrqProtection`, `SpscProtection` (lock-free SPSC, no masking), or `IrqProtection` (PRIMASK save/restore, safe in both ISR and non-ISR contexts)
+- **Policy-based IRQ protection** — `IrqProtection<>::None` / `SPSC` / `MPSC` / `SPMC` / `MPMC`; producer and consumer guards are independent, so MPSC pays no overhead on `pop` and SPMC pays none on `push`; swap `PrimaskLock` for any custom lock (e.g. FreeRTOS) via `IrqProtection<FreeRtosLock>::MPMC`
 - **Compile-time unit tests** — a `static_assert` in the constructor verifies correctness at build time
 - **Header-only** — single `.h` file per implementation, no dependencies beyond the C++ standard library
 - **C++17** or later required
