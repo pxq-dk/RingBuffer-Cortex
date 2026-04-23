@@ -26,7 +26,7 @@
 
 #pragma once
 
-inline constexpr const char* RINGBUFFER_PACKEDSTATE_VERSION = "1.1.0";
+inline constexpr const char* RINGBUFFER_PACKEDSTATE_VERSION = "1.2.0";
 
 #include <cstdint>
 #include <cstddef>
@@ -255,6 +255,21 @@ class RingBuffer_PackedState
 	alignas(4) struct { half_type head; half_type tail; } state;
 	alignas(alignof(T)) element_type buffer[Size];
 
+	// Non-volatile snapshot — same layout as state, always uint16_t regardless of IrqPolicy.
+	struct StateSnapshot { uint16_t head; uint16_t tail; };
+
+	// Atomic snapshot of head and tail. At runtime: single volatile LDR into StateSnapshot
+	// (state is alignas(4), same layout). At compile time: two separate reads
+	// (reinterpret_cast not allowed in constexpr).
+	RB_OPT_INLINE constexpr StateSnapshot readHT() const {
+		if (std::is_constant_evaluated()) {
+			return { static_cast<uint16_t>(state.head), static_cast<uint16_t>(state.tail) };
+		}
+		StateSnapshot snap;
+		*reinterpret_cast<uint32_t*>(&snap) = *reinterpret_cast<const volatile uint32_t*>(&state);
+		return snap;
+	}
+
 	RB_OPT_INLINE constexpr uint16_t nextIndex(uint16_t idx) const {
 		if constexpr (is_power_of_two) return (idx + 1) & static_cast<uint16_t>(Size - 1);
 		else                           return (idx + 1 >= static_cast<uint16_t>(Size)) ? static_cast<uint16_t>(0) : static_cast<uint16_t>(idx + 1);
@@ -280,28 +295,35 @@ class RingBuffer_PackedState
 
 	RB_OPT_INLINE constexpr bool push(const T& item) {
 		ProducerGuard g;
-		uint16_t h      = state.head;
-		uint16_t t      = state.tail;
-		uint16_t next_h = nextIndex(h);
-		if (next_h == t) return false;                   // full
-		buffer[h] = item;
+		auto s          = readHT();
+		uint16_t next_h = nextIndex(s.head);
+		if (next_h == s.tail) return false;              // full
+		buffer[s.head] = item;
 		state.head = next_h;                             // single STRH
 		return true;
 	}
 
 	RB_OPT_INLINE constexpr bool pop(T& item) {
 		ConsumerGuard g;
-		uint16_t h = state.head;
-		uint16_t t = state.tail;
-		if (h == t) return false;                         // empty
-		item  = buffer[t];
-		state.tail = nextIndex(t);                        // single STRH
+		auto s = readHT();
+		if (s.head == s.tail) return false;              // empty
+		item = buffer[s.tail];
+		state.tail = nextIndex(s.tail);                  // single STRH
 		return true;
 	}
 
-	RB_OPT_INLINE constexpr bool   isFull()   const { uint16_t h = state.head, t = state.tail; return nextIndex(h) == t; }
-	RB_OPT_INLINE constexpr bool   isEmpty()  const { return static_cast<uint16_t>(state.head) == static_cast<uint16_t>(state.tail); }
-	RB_OPT_INLINE constexpr size_t getCount() const { uint16_t h = state.head, t = state.tail; return wrapSize((uint32_t)h - (uint32_t)t + Size); }
+	// Returns the next element without advancing tail. Uses readHT() for an atomic
+	// snapshot of head and tail, so the empty check and read index are always consistent.
+	RB_OPT_INLINE constexpr bool peek(T& item) const {
+		auto s = readHT();
+		if (s.head == s.tail) return false;
+		item = static_cast<T>(buffer[s.tail]);
+		return true;
+	}
+
+	RB_OPT_INLINE constexpr bool   isFull()   const { auto s = readHT(); return nextIndex(s.head) == s.tail; }
+	RB_OPT_INLINE constexpr bool   isEmpty()  const { auto s = readHT(); return s.head == s.tail; }
+	RB_OPT_INLINE constexpr size_t getCount() const { auto s = readHT(); return wrapSize((uint32_t)s.head - (uint32_t)s.tail + Size); }
 
 	struct ContiguousArea {
 		element_type* ptr;
@@ -317,8 +339,7 @@ class RingBuffer_PackedState
 	// before the buffer wraps. Call commit_push() after writing.
 	// NOTE: reads state without a Guard — only one producer may call this at a time.
 	RB_OPT constexpr ContiguousArea get_contiguous_push_area(size_t max_size) {
-		uint16_t h = state.head;
-		uint16_t t = state.tail;
+		auto [h, t] = readHT();
 		size_t   available = wrapSize((uint32_t)t + Size - (uint32_t)h - 1);
 		size_t   contiguous = Size - h;
 		if (contiguous > available) contiguous = available;
@@ -329,8 +350,7 @@ class RingBuffer_PackedState
 	// Advances head by count after a contiguous push
 	RB_OPT constexpr void commit_push(size_t count) {
 		ProducerGuard g;
-		uint16_t h = state.head;
-		uint16_t t = state.tail;
+		auto [h, t] = readHT();
 		size_t   available = wrapSize((uint32_t)t + Size - (uint32_t)h - 1);
 		if (count > available) count = available;
 		if constexpr (is_power_of_two)
@@ -344,8 +364,7 @@ class RingBuffer_PackedState
 	// before the buffer wraps. Call commit_pop() after consuming.
 	// NOTE: reads state without a Guard — only one consumer may call this at a time.
 	RB_OPT constexpr ConstContiguousArea get_contiguous_pop_area(size_t max_size) const {
-		uint16_t h = state.head;
-		uint16_t t = state.tail;
+		auto [h, t] = readHT();
 		size_t   available = wrapSize((uint32_t)h - (uint32_t)t + Size);
 		size_t   contiguous = Size - t;
 		if (contiguous > available) contiguous = available;
@@ -356,8 +375,7 @@ class RingBuffer_PackedState
 	// Advances tail by count after a contiguous pop
 	RB_OPT constexpr void commit_pop(size_t count) {
 		ConsumerGuard g;
-		uint16_t h = state.head;
-		uint16_t t = state.tail;
+		auto [h, t] = readHT();
 		size_t   available = wrapSize((uint32_t)h - (uint32_t)t + Size);
 		if (count > available) count = available;
 		if constexpr (is_power_of_two)
@@ -371,8 +389,7 @@ class RingBuffer_PackedState
 	// and returns pointer + count. Write to ptr after the call — no commit needed.
 	RB_OPT constexpr ContiguousArea reserve_push(size_t max_size) {
 		ProducerGuard g;
-		uint16_t h = state.head;
-		uint16_t t = state.tail;
+		auto [h, t] = readHT();
 		size_t   available  = wrapSize((uint32_t)t + Size - (uint32_t)h - 1);
 		size_t   contiguous = Size - h;
 		if (contiguous > available) contiguous = available;
@@ -390,8 +407,7 @@ class RingBuffer_PackedState
 	// and returns pointer + count. Read from ptr after the call — no commit needed.
 	RB_OPT constexpr ConstContiguousArea reserve_pop(size_t max_size) {
 		ConsumerGuard g;
-		uint16_t h = state.head;
-		uint16_t t = state.tail;
+		auto [h, t] = readHT();
 		size_t   available  = wrapSize((uint32_t)h - (uint32_t)t + Size);
 		size_t   contiguous = Size - t;
 		if (contiguous > available) contiguous = available;
