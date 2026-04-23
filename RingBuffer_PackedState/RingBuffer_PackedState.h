@@ -46,17 +46,18 @@ struct PrimaskLock {
 	static void     unlock(uint32_t p) { __set_PRIMASK(p); }
 };
 
-template<typename LockImpl = PrimaskLock>
-struct IrqProtection {
+struct Topology {
 	// Single context — no concurrency at all.
+	template<typename LockImpl = PrimaskLock>
 	struct None : LockImpl {
 		static constexpr bool needs_volatile = false;
 		static constexpr bool lock_p_needed  = false;
 		static constexpr bool lock_c_needed  = false;
 	};
 
-	// Single Producer, Single Consumer — ISR owns head, main owns tail.
+	// Single Producer, Single Consumer — e.g. ISR owns head and main owns tail, or vice versa.
 	// No guard on either side; volatile ensures actual LDRH/STRH on every access.
+	template<typename LockImpl = PrimaskLock>
 	struct SPSC : LockImpl {
 		static constexpr bool needs_volatile = true;
 		static constexpr bool lock_p_needed  = false;
@@ -64,6 +65,7 @@ struct IrqProtection {
 	};
 
 	// Multiple Producers, Single Consumer — producer side guarded, consumer side free.
+	template<typename LockImpl = PrimaskLock>
 	struct MPSC : LockImpl {
 		static constexpr bool needs_volatile = true;
 		static constexpr bool lock_p_needed  = true;
@@ -71,6 +73,7 @@ struct IrqProtection {
 	};
 
 	// Single Producer, Multiple Consumers — consumer side guarded, producer side free.
+	template<typename LockImpl = PrimaskLock>
 	struct SPMC : LockImpl {
 		static constexpr bool needs_volatile = true;
 		static constexpr bool lock_p_needed  = false;
@@ -78,6 +81,7 @@ struct IrqProtection {
 	};
 
 	// Multiple Producers, Multiple Consumers — both sides guarded.
+	template<typename LockImpl = PrimaskLock>
 	struct MPMC : LockImpl {
 		static constexpr bool needs_volatile = true;
 		static constexpr bool lock_p_needed  = true;
@@ -223,7 +227,7 @@ class unit_test_ringbuffer
 // Reads are LDRH, writes are STRH — in SPSC each side owns one field exclusively.
 // One slot is sacrificed to distinguish full from empty without a count variable.
 // Effective capacity is Size-1.
-template<typename T, size_t Size, typename IrqPolicy = IrqProtection<>::None, bool _IsTestInstance = false>
+template<typename T, size_t Size, typename IrqPolicy = Topology::None<>, bool _IsTestInstance = false>
 class RingBuffer_PackedState
 {
 	static_assert(Size >= 2 && Size <= 65535, "RingBuffer_PackedState: Size must be in range [2, 65535]");
@@ -269,7 +273,7 @@ class RingBuffer_PackedState
 	{
 		if constexpr (!_IsTestInstance)
 		{
-			using test_type = RingBuffer_PackedState<T, 4, IrqProtection<>::None, true>;
+			using test_type = RingBuffer_PackedState<T, 4, Topology::None<>, true>;
 			static_assert(unit_test_ringbuffer<test_type>::run_test(), "RingBuffer_PackedState unit test failed!");
 		}
 	}
