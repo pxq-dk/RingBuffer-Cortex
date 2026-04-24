@@ -26,7 +26,7 @@
 
 #pragma once
 
-inline constexpr const char* RINGBUFFER_PACKEDSTATE_VERSION = "1.2.5";
+inline constexpr const char* RINGBUFFER_PACKEDSTATE_VERSION = "1.2.6";
 
 #include <cstdint>
 #include <cstddef>
@@ -329,6 +329,17 @@ class RingBuffer_PackedState
 
 	RB_OPT_INLINE constexpr bool   isFull()   const { auto s = readHT(); return nextIndex(s.head) == s.tail; }
 	RB_OPT_INLINE constexpr bool   isEmpty()  const { auto s = readHT(); return s.head == s.tail; }
+
+	// Resets the buffer to empty. Writes both head and tail — not safe to call
+	// while a DMA transfer is active on this buffer; stop the DMA first.
+	// Always acquires a lock regardless of topology since both fields are written.
+	void clear() {
+		uint32_t p = IrqPolicy::lock();
+		state.head = 0;
+		state.tail = 0;
+		IrqPolicy::unlock(p);
+	}
+
 	RB_OPT_INLINE constexpr size_t getCount() const {
 		auto s = readHT();
 		if constexpr (is_power_of_two) return static_cast<size_t>((uint32_t)(s.head - s.tail) & (Size - 1));
