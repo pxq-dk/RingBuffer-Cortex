@@ -6,6 +6,18 @@ A ring buffer optimised for ARM Cortex-M microcontrollers, with lock-free SPSC s
 
 ---
 
+## Why another ring buffer?
+
+Most Cortex-M ring buffers use word-sized (`size_t` / `uint32_t`) indices with `std::atomic` or plain `volatile`, and either require power-of-2 sizes or silently call `__aeabi_uidivmod` on wrap. This one takes a different set of micro-architectural decisions:
+
+- **Lock-free SPSC without `std::atomic`** — head and tail are packed as two `uint16_t` fields in a 4-byte-aligned struct. The producer `STRH` at offset 0 and the consumer `STRH` at offset 2 target different bus addresses — they cannot collide. No libatomic calls, no fences.
+- **Single-LDR state snapshot** — both indices read in one 32-bit bus transaction (`readHT()`). Other libraries do two separate reads or rely on atomic word-sized indices.
+- **Topology-selectable IRQ protection** — `None` / `SPSC` / `MPSC` / `SPMC` / `MPMC` chosen per-instance, with producer and consumer guards independent (MPSC pays no guard on `pop`, SPMC pays none on `push`).
+- **No software division on any path** — power-of-2 sizes use `AND`, non-power-of-2 use compare-and-subtract. No `__aeabi_uidivmod` ever emitted.
+- **Compile-time unit tests** — `static_assert` in the constructor runs a full test suite at instantiation. A broken build will not compile.
+
+---
+
 ## Quick Start
 
 ```cpp
