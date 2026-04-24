@@ -143,6 +143,7 @@ auto out = rb.reserve_pop(32);    // tail advances immediately
 | `isFull()` | Returns `true` if buffer is full. |
 | `isEmpty()` | Returns `true` if buffer is empty. |
 | `getCount()` | Returns number of elements currently in buffer. |
+| `clear()` | Resets buffer to empty. Always IRQ-protected regardless of topology. Do not call while a DMA transfer is active on this buffer — stop the DMA first. |
 
 > All functions use `readHT()` for their initial state read — a single 32-bit `LDR` atomic snapshot of head and tail, safe across ISR boundaries. Writes back to `state.head` or `state.tail` remain individual `STRH` instructions.
 | `get_contiguous_push_area(max)` | Returns pointer + count of contiguous writable slots. Call `commit_push()` after writing. |
