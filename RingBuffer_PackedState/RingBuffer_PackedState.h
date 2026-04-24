@@ -26,7 +26,7 @@
 
 #pragma once
 
-inline constexpr const char* RINGBUFFER_PACKEDSTATE_VERSION = "1.2.4";
+inline constexpr const char* RINGBUFFER_PACKEDSTATE_VERSION = "1.2.5";
 
 #include <cstdint>
 #include <cstddef>
@@ -329,7 +329,11 @@ class RingBuffer_PackedState
 
 	RB_OPT_INLINE constexpr bool   isFull()   const { auto s = readHT(); return nextIndex(s.head) == s.tail; }
 	RB_OPT_INLINE constexpr bool   isEmpty()  const { auto s = readHT(); return s.head == s.tail; }
-	RB_OPT_INLINE constexpr size_t getCount() const { auto s = readHT(); return wrapSize((uint32_t)s.head - (uint32_t)s.tail + Size); }
+	RB_OPT_INLINE constexpr size_t getCount() const {
+		auto s = readHT();
+		if constexpr (is_power_of_two) return static_cast<size_t>((uint32_t)(s.head - s.tail) & (Size - 1));
+		else                           return wrapSize((uint32_t)s.head - (uint32_t)s.tail + Size);
+	}
 
 	struct ContiguousArea {
 		element_type* ptr;
