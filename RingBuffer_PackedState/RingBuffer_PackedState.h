@@ -26,7 +26,7 @@
 
 #pragma once
 
-inline constexpr const char* RINGBUFFER_PACKEDSTATE_VERSION = "1.2.2";
+inline constexpr const char* RINGBUFFER_PACKEDSTATE_VERSION = "1.2.3";
 
 #include <cstdint>
 #include <cstddef>
@@ -302,7 +302,7 @@ class RingBuffer_PackedState
 		ProducerGuard g;
 		auto s          = readHT();
 		uint16_t next_h = nextIndex(s.head);
-		if (next_h == s.tail) return false;              // full
+		if (next_h == s.tail) [[unlikely]] return false; // full
 		buffer[s.head] = item;
 		state.head = next_h;                             // single STRH
 		return true;
@@ -311,7 +311,7 @@ class RingBuffer_PackedState
 	RB_OPT_INLINE constexpr bool pop(T& item) {
 		ConsumerGuard g;
 		auto s = readHT();
-		if (s.head == s.tail) return false;              // empty
+		if (s.head == s.tail) [[unlikely]] return false; // empty
 		item = buffer[s.tail];
 		state.tail = nextIndex(s.tail);                  // single STRH
 		return true;
@@ -321,7 +321,7 @@ class RingBuffer_PackedState
 	// snapshot of head and tail, so the empty check and read index are always consistent.
 	RB_OPT_INLINE constexpr bool peek(T& item) const {
 		auto s = readHT();
-		if (s.head == s.tail) return false;
+		if (s.head == s.tail) [[unlikely]] return false;
 		item = static_cast<T>(buffer[s.tail]);
 		return true;
 	}
