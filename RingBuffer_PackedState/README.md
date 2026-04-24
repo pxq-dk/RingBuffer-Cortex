@@ -145,6 +145,8 @@ auto out = rb.reserve_pop(32);    // tail advances immediately
 | `getCount()` | Returns number of elements currently in buffer. |
 | `getSpace()` | Returns number of free slots remaining. Producer counterpart to `getCount()`. |
 | `skip(count)` | Discards up to `count` elements by advancing tail without reading. Clamped to available data. Alias for `commit_pop()` — use when intent is discard rather than DMA consume. |
+| `push_n(ptr, count)` | Pushes up to `count` elements from `ptr`. Returns number actually pushed. Handles wrap automatically. Uses `memcpy` for trivially copyable types. ProducerGuard protected. |
+| `pop_n(ptr, count)` | Pops up to `count` elements into `ptr`. Returns number actually popped. Handles wrap automatically. Uses `memcpy` for trivially copyable types. ConsumerGuard protected. |
 | `clear()` | Resets buffer to empty. Always IRQ-protected regardless of topology. Do not call while a DMA transfer is active on this buffer — stop the DMA first. |
 
 > All functions use `readHT()` for their initial state read — a single 32-bit `LDR` atomic snapshot of head and tail, safe across ISR boundaries. Writes back to `state.head` or `state.tail` remain individual `STRH` instructions.
