@@ -26,10 +26,11 @@
 
 #pragma once
 
-inline constexpr const char* RINGBUFFER_PACKEDSTATE_VERSION = "1.2.8";
+inline constexpr const char* RINGBUFFER_PACKEDSTATE_VERSION = "1.2.9";
 
 #include <cstdint>
 #include <cstddef>
+#include <cstring>
 #include <type_traits>
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -325,6 +326,62 @@ class RingBuffer_PackedState
 		if (s.head == s.tail) [[unlikely]] return false;
 		item = static_cast<T>(buffer[s.tail]);
 		return true;
+	}
+
+	// Pushes up to count elements from ptr. Returns the number actually pushed —
+	// may be less than count if space is limited. Handles wrap automatically.
+	// ProducerGuard protected.
+	RB_OPT constexpr size_t push_n(const T* ptr, size_t count) {
+		ProducerGuard g;
+		auto [h, t] = readHT();
+		size_t available = wrapSize((uint32_t)t + Size - (uint32_t)h - 1);
+		if (count > available) count = available;
+		size_t first = Size - h;
+		if (first > count) first = count;
+		if constexpr (std::is_trivially_copyable_v<T>) {
+			// volatile stripped via const_cast — safe for SRAM: memcpy always
+			// generates actual stores regardless of the volatile qualifier.
+			memcpy(const_cast<T*>(&buffer[h]),  ptr,         first           * sizeof(T));
+			memcpy(const_cast<T*>(&buffer[0]),  ptr + first, (count - first) * sizeof(T));
+		} else {
+			for (size_t i = 0; i < first; ++i)        buffer[h + i] = ptr[i];
+			for (size_t i = 0; i < count - first; ++i) buffer[i]    = ptr[first + i];
+		}
+		uint32_t h32 = (uint32_t)h + count;
+		if constexpr (is_power_of_two)
+			h = static_cast<uint16_t>(h32 & (Size - 1));
+		else
+			h = static_cast<uint16_t>(h32 >= Size ? h32 - Size : h32);
+		state.head = h;                                  // single STRH
+		return count;
+	}
+
+	// Pops up to count elements into ptr. Returns the number actually popped —
+	// may be less than count if fewer elements are available. Handles wrap automatically.
+	// ConsumerGuard protected.
+	RB_OPT constexpr size_t pop_n(T* ptr, size_t count) {
+		ConsumerGuard g;
+		auto [h, t] = readHT();
+		size_t available = wrapSize((uint32_t)h - (uint32_t)t + Size);
+		if (count > available) count = available;
+		size_t first = Size - t;
+		if (first > count) first = count;
+		if constexpr (std::is_trivially_copyable_v<T>) {
+			// volatile stripped via const_cast — safe for SRAM: memcpy always
+			// generates actual loads regardless of the volatile qualifier.
+			memcpy(ptr,         const_cast<const T*>(&buffer[t]), first           * sizeof(T));
+			memcpy(ptr + first, const_cast<const T*>(&buffer[0]), (count - first) * sizeof(T));
+		} else {
+			for (size_t i = 0; i < first; ++i)        ptr[i]        = static_cast<T>(buffer[t + i]);
+			for (size_t i = 0; i < count - first; ++i) ptr[first + i] = static_cast<T>(buffer[i]);
+		}
+		uint32_t t32 = (uint32_t)t + count;
+		if constexpr (is_power_of_two)
+			t = static_cast<uint16_t>(t32 & (Size - 1));
+		else
+			t = static_cast<uint16_t>(t32 >= Size ? t32 - Size : t32);
+		state.tail = t;                                  // single STRH
+		return count;
 	}
 
 	RB_OPT_INLINE constexpr bool   isFull()   const { auto s = readHT(); return nextIndex(s.head) == s.tail; }
