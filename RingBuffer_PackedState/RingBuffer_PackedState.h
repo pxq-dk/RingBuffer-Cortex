@@ -26,7 +26,7 @@
 
 #pragma once
 
-inline constexpr const char* RINGBUFFER_PACKEDSTATE_VERSION = "1.2.0";
+inline constexpr const char* RINGBUFFER_PACKEDSTATE_VERSION = "1.2.1";
 
 #include <cstdint>
 #include <cstddef>
@@ -353,10 +353,11 @@ class RingBuffer_PackedState
 		auto [h, t] = readHT();
 		size_t   available = wrapSize((uint32_t)t + Size - (uint32_t)h - 1);
 		if (count > available) count = available;
+		uint32_t h32 = (uint32_t)h + count;
 		if constexpr (is_power_of_two)
-			h = static_cast<uint16_t>((h + count) & (Size - 1));
+			h = static_cast<uint16_t>(h32 & (Size - 1));
 		else
-			h = static_cast<uint16_t>((h + count) % Size);
+			h = static_cast<uint16_t>(h32 >= Size ? h32 - Size : h32);
 		state.head = h;                                      // single STRH
 	}
 
@@ -378,10 +379,11 @@ class RingBuffer_PackedState
 		auto [h, t] = readHT();
 		size_t   available = wrapSize((uint32_t)h - (uint32_t)t + Size);
 		if (count > available) count = available;
+		uint32_t t32 = (uint32_t)t + count;
 		if constexpr (is_power_of_two)
-			t = static_cast<uint16_t>((t + count) & (Size - 1));
+			t = static_cast<uint16_t>(t32 & (Size - 1));
 		else
-			t = static_cast<uint16_t>((t + count) % Size);
+			t = static_cast<uint16_t>(t32 >= Size ? t32 - Size : t32);
 		state.tail = t;                                      // single STRH
 	}
 
@@ -395,10 +397,11 @@ class RingBuffer_PackedState
 		if (contiguous > available) contiguous = available;
 		if (contiguous > max_size)  contiguous = max_size;
 		element_type* ptr = &buffer[h];
+		uint32_t h32 = (uint32_t)h + contiguous;
 		if constexpr (is_power_of_two)
-			h = static_cast<uint16_t>((h + contiguous) & (Size - 1));
+			h = static_cast<uint16_t>(h32 & (Size - 1));
 		else
-			h = static_cast<uint16_t>((h + contiguous) % Size);
+			h = static_cast<uint16_t>(h32 >= Size ? h32 - Size : h32);
 		state.head = h;                                      // single STRH
 		return { ptr, contiguous };
 	}
@@ -413,10 +416,11 @@ class RingBuffer_PackedState
 		if (contiguous > available) contiguous = available;
 		if (contiguous > max_size)  contiguous = max_size;
 		const element_type* ptr = &buffer[t];
+		uint32_t t32 = (uint32_t)t + contiguous;
 		if constexpr (is_power_of_two)
-			t = static_cast<uint16_t>((t + contiguous) & (Size - 1));
+			t = static_cast<uint16_t>(t32 & (Size - 1));
 		else
-			t = static_cast<uint16_t>((t + contiguous) % Size);
+			t = static_cast<uint16_t>(t32 >= Size ? t32 - Size : t32);
 		state.tail = t;                                      // single STRH
 		return { ptr, contiguous };
 	}
