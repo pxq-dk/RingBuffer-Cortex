@@ -26,7 +26,7 @@
 
 #pragma once
 
-inline constexpr const char* RINGBUFFER_PACKEDSTATE_VERSION = "1.2.1";
+inline constexpr const char* RINGBUFFER_PACKEDSTATE_VERSION = "1.2.2";
 
 #include <cstdint>
 #include <cstddef>
@@ -258,15 +258,20 @@ class RingBuffer_PackedState
 	// Non-volatile snapshot — same layout as state, always uint16_t regardless of IrqPolicy.
 	struct StateSnapshot { uint16_t head; uint16_t tail; };
 
-	// Atomic snapshot of head and tail. At runtime: single volatile LDR into StateSnapshot
-	// (state is alignas(4), same layout). At compile time: two separate reads
-	// (reinterpret_cast not allowed in constexpr).
+	// Atomic snapshot of head and tail. At runtime: single 32-bit LDR into StateSnapshot
+	// (state is alignas(4), same layout). Volatile only when the policy requires it
+	// (ISR concurrency possible) — otherwise the compiler is free to CSE repeated reads.
+	// At compile time: two separate reads (reinterpret_cast not allowed in constexpr).
 	RB_OPT_INLINE constexpr StateSnapshot readHT() const {
 		if (std::is_constant_evaluated()) {
 			return { static_cast<uint16_t>(state.head), static_cast<uint16_t>(state.tail) };
 		}
 		StateSnapshot snap;
-		*reinterpret_cast<uint32_t*>(&snap) = *reinterpret_cast<const volatile uint32_t*>(&state);
+		if constexpr (IrqPolicy::needs_volatile) {
+			*reinterpret_cast<uint32_t*>(&snap) = *reinterpret_cast<const volatile uint32_t*>(&state);
+		} else {
+			*reinterpret_cast<uint32_t*>(&snap) = *reinterpret_cast<const uint32_t*>(&state);
+		}
 		return snap;
 	}
 
