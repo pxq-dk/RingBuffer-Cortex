@@ -26,7 +26,7 @@
 
 #pragma once
 
-inline constexpr const char* RINGBUFFER_PACKEDSTATE_VERSION = "1.2.3";
+inline constexpr const char* RINGBUFFER_PACKEDSTATE_VERSION = "1.2.4";
 
 #include <cstdint>
 #include <cstddef>
@@ -266,13 +266,14 @@ class RingBuffer_PackedState
 		if (std::is_constant_evaluated()) {
 			return { static_cast<uint16_t>(state.head), static_cast<uint16_t>(state.tail) };
 		}
-		StateSnapshot snap;
+		typedef uint32_t __attribute__((may_alias)) u32_alias;
+		uint32_t raw;
 		if constexpr (IrqPolicy::needs_volatile) {
-			*reinterpret_cast<uint32_t*>(&snap) = *reinterpret_cast<const volatile uint32_t*>(&state);
+			raw = *reinterpret_cast<const volatile u32_alias*>(&state);
 		} else {
-			*reinterpret_cast<uint32_t*>(&snap) = *reinterpret_cast<const uint32_t*>(&state);
+			raw = *reinterpret_cast<const u32_alias*>(&state);
 		}
-		return snap;
+		return { static_cast<uint16_t>(raw), static_cast<uint16_t>(raw >> 16) };
 	}
 
 	RB_OPT_INLINE constexpr uint16_t nextIndex(uint16_t idx) const {
