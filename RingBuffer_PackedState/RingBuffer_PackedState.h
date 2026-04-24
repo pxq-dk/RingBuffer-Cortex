@@ -26,7 +26,7 @@
 
 #pragma once
 
-inline constexpr const char* RINGBUFFER_PACKEDSTATE_VERSION = "1.2.7";
+inline constexpr const char* RINGBUFFER_PACKEDSTATE_VERSION = "1.2.8";
 
 #include <cstdint>
 #include <cstddef>
@@ -346,6 +346,11 @@ class RingBuffer_PackedState
 		else                           return wrapSize((uint32_t)s.head - (uint32_t)s.tail + Size);
 	}
 	RB_OPT_INLINE constexpr size_t getSpace() const { return capacity - getCount(); }
+
+	// Discards up to count elements without reading. Consumer operation.
+	// Equivalent to commit_pop() — provided for clarity at call sites where
+	// data is intentionally discarded rather than consumed after a DMA read.
+	void skip(size_t count) { commit_pop(count); }
 
 	struct ContiguousArea {
 		element_type* ptr;
