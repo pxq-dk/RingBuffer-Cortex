@@ -26,7 +26,7 @@
 
 #pragma once
 
-inline constexpr const char* RINGBUFFER_PACKEDSTATE_VERSION = "1.2.9";
+inline constexpr const char* RINGBUFFER_PACKEDSTATE_VERSION = "1.3.0";
 
 #include <cstdint>
 #include <cstddef>
@@ -325,6 +325,18 @@ class RingBuffer_PackedState
 		auto s = readHT();
 		if (s.head == s.tail) [[unlikely]] return false;
 		item = static_cast<T>(buffer[s.tail]);
+		return true;
+	}
+
+	// Returns the element at the given offset from tail without advancing tail.
+	// offset=0 is equivalent to peek(item) — the next element to be popped.
+	// Returns false if offset is beyond the number of available elements.
+	RB_OPT_INLINE constexpr bool peek(T& item, size_t offset) const {
+		auto s = readHT();
+		size_t available = wrapSize((uint32_t)s.head - (uint32_t)s.tail + Size);
+		if (offset >= available) [[unlikely]] return false;
+		size_t idx = wrapSize((uint32_t)s.tail + offset);
+		item = static_cast<T>(buffer[idx]);
 		return true;
 	}
 
