@@ -140,6 +140,7 @@ auto out = rb.reserve_pop(32);    // tail advances immediately
 | `push(item)` | Push item. Returns `false` if full. Guard-protected. |
 | `pop(item)` | Pop item. Returns `false` if empty. Guard-protected. |
 | `peek(item)` | Read next item without advancing tail. Returns `false` if empty. No guard needed. |
+| `peek(item, offset)` | Read item at `offset` from tail (0 = next, 1 = second oldest, …) without advancing tail. Returns `false` if `offset >= getCount()`. No guard needed. |
 | `isFull()` | Returns `true` if buffer is full. |
 | `isEmpty()` | Returns `true` if buffer is empty. |
 | `getCount()` | Returns number of elements currently in buffer. |
@@ -150,6 +151,8 @@ auto out = rb.reserve_pop(32);    // tail advances immediately
 | `clear()` | Resets buffer to empty. Always IRQ-protected regardless of topology. Do not call while a DMA transfer is active on this buffer — stop the DMA first. |
 
 > All functions use `readHT()` for their initial state read — a single 32-bit `LDR` atomic snapshot of head and tail, safe across ISR boundaries. Writes back to `state.head` or `state.tail` remain individual `STRH` instructions.
+
+> **Note on `peek` in `SPMC`/`MPMC`:** `peek` does not acquire a `ConsumerGuard`. Another consumer may pop the element between `peek`'s state snapshot and the buffer read, returning logically-stale data (or, for multi-byte `T`, a torn read if the producer wraps and overwrites the slot). For atomic peek-then-act semantics, use `pop` into a local variable instead.
 | `get_contiguous_push_area(max)` | Returns pointer + count of contiguous writable slots. Call `commit_push()` after writing. |
 | `commit_push(count)` | Advances head by `count` after a contiguous push. Clamped to available space. |
 | `get_contiguous_pop_area(max)` | Returns pointer + count of contiguous readable slots. Call `commit_pop()` after reading. |
