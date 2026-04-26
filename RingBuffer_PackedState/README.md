@@ -237,11 +237,11 @@ A `static_assert` in the constructor runs `unit_test_ringbuffer::run_test()` at 
 
 Copyright (c) 2026 PxQ Technologies — https://pxq.dk
 
-**Open Source / Non-Commercial Use:**
-Free to use, modify, and distribute under the MIT License, provided it is used solely in open source or non-commercial projects. The copyright notice must be retained.
+This software is dual-licensed:
 
-**Commercial Use:**
-Requires either a written commercial license agreement with PxQ Technologies, or direct delivery by Erik Nørskov (PxQ Technologies) as part of a paid engagement or employment, in which case a license is granted for use within that specific project scope only.
+**Open Source — GNU General Public License v3.0 (GPLv3):** Free to use, modify, and distribute under the terms of the GPLv3. Note that GPLv3 is strong copyleft — derivative works and products that incorporate this software must also be released under GPLv3 (i.e. open-sourced). See [LICENSE](LICENSE) or https://www.gnu.org/licenses/gpl-3.0.html for full terms.
+
+**Commercial License:** For use in proprietary or closed-source products (e.g. firmware that will not be open-sourced), a commercial license is available — either as a separate written agreement, or via direct delivery by Erik Nørskov (PxQ Technologies) as part of a paid engagement, in which case the license is granted for that specific project scope only.
 
 Contact: https://pxq.dk
 

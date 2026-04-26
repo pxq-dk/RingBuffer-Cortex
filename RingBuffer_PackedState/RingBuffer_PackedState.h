@@ -9,24 +9,29 @@
  *
  *  Dual License:
  *
- *  1. Open Source / Non-Commercial Use:
- *     This file is free to use, modify, and distribute under the terms of the
- *     MIT License, provided it is used solely in open source or non-commercial
- *     projects. The above copyright notice must be retained in all copies.
+ *  1. GNU General Public License v3.0 (GPLv3)
+ *     This file is free software: you can redistribute it and/or modify
+ *     it under the terms of the GNU General Public License as published by
+ *     the Free Software Foundation, version 3 of the License.
  *
- *  2. Commercial Use:
- *     Use of this file in a commercial or proprietary product requires either:
- *     a) A separate written commercial license agreement with PxQ Technologies, or
- *     b) Direct delivery of this file by Erik Nørskov (PxQ Technologies) as part
- *        of a paid engagement or employment, in which case a license is granted
- *        for use within that specific project scope only.
+ *     This file is distributed in the hope that it will be useful,
+ *     but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+ *     General Public License for more details: https://www.gnu.org/licenses/
+ *
+ *  2. Commercial License
+ *     For use in proprietary or closed-source products that cannot or
+ *     do not wish to comply with the GPLv3, a separate commercial license
+ *     is available from PxQ Technologies — either as a written agreement,
+ *     or via direct delivery by Erik Nørskov as part of a paid engagement
+ *     (in which case the license is granted for that specific project scope only).
  *
  *     Contact: https://pxq.dk
  */
 
 #pragma once
 
-inline constexpr const char* RINGBUFFER_PACKEDSTATE_VERSION = "1.3.0";
+inline constexpr const char* RINGBUFFER_PACKEDSTATE_VERSION = "1.3.1";
 
 #include <cstdint>
 #include <cstddef>

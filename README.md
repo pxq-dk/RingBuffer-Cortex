@@ -68,9 +68,11 @@ ISR-safe, DMA-friendly ring buffer for ARM Cortex-M. Head and tail stored as adj
 
 Copyright (c) 2026 PxQ Technologies — https://pxq.dk
 
-**Open Source / Non-Commercial Use:** MIT License — free to use, modify, and distribute in open source or non-commercial projects. Copyright notice must be retained.
+**Dual-licensed: GPLv3 + commercial.**
 
-**Commercial Use:** Requires a written commercial license agreement with PxQ Technologies, or direct delivery by Erik Nørskov (PxQ Technologies) as part of a paid engagement, in which case a license is granted for that specific project scope.
+**Open Source (GPLv3):** Free under [GPLv3](LICENSE) — note that GPLv3 is strong copyleft, so derivative works and products incorporating this software must also be released under GPLv3.
+
+**Commercial:** For use in proprietary or closed-source products, a commercial license is available from PxQ Technologies — either as a written agreement, or via direct delivery by Erik Nørskov as part of a paid engagement.
 
 Contact: https://pxq.dk
 
