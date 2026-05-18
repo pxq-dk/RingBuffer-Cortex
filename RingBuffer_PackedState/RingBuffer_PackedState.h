@@ -38,7 +38,7 @@ inline constexpr const char* RINGBUFFER_PACKEDSTATE_VERSION = "1.3.1";
 // static stress buffer from the build — no flash or RAM cost. The constexpr
 // mirror is provided for use in templated/generic code with `if constexpr`.
 // Caller is responsible for guarding call sites with `#if RB_ENABLE_RUNTIME_TESTS`.
-#define RB_ENABLE_RUNTIME_TESTS  1
+#define RB_ENABLE_RUNTIME_TESTS  0
 inline constexpr bool RB_ENABLE_RUNTIME_TESTS_v = RB_ENABLE_RUNTIME_TESTS;
 
 #if RB_ENABLE_RUNTIME_TESTS
