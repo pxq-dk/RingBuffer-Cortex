@@ -33,6 +33,57 @@
 
 inline constexpr const char* RINGBUFFER_PACKEDSTATE_VERSION = "1.3.1";
 
+// Master switch for the runtime test code (Layer 1 selftest + Layer 2 stress
+// test). Set to 0 to remove all test definitions, declarations, and the
+// static stress buffer from the build — no flash or RAM cost. The constexpr
+// mirror is provided for use in templated/generic code with `if constexpr`.
+// Caller is responsible for guarding call sites with `#if RB_ENABLE_RUNTIME_TESTS`.
+#define RB_ENABLE_RUNTIME_TESTS  1
+inline constexpr bool RB_ENABLE_RUNTIME_TESTS_v = RB_ENABLE_RUNTIME_TESTS;
+
+#if RB_ENABLE_RUNTIME_TESTS
+// One-call entry point. Runs the Layer 1 compile-time-test suite at runtime
+// (BKPT on fail), then arms the Layer 2 concurrent SPSC stress test
+// (TIM6 producer ISR + main-loop consumer). Caller then needs to call
+// RingBuffer_PackedState_stress_consumer_tick() inside the main loop.
+// Precondition: MX_TIM6_Init() has run (RCC clock enabled, base init done).
+void RingBuffer_PackedState_runtime_tests_init();
+
+// Main-loop consumer hook. Waits until the test buffer is half full, then
+// drains in a tight loop; BKPT on first sequence mismatch.
+void RingBuffer_PackedState_stress_consumer_tick();
+
+// Lower-level entry points exposed for users who want to drive the stress
+// test from their own ISR / loop rather than the bundled runtime_tests_init.
+bool RingBuffer_PackedState_runtime_selftest();
+void RingBuffer_PackedState_stress_init();
+void RingBuffer_PackedState_stress_producer_tick();
+
+// Stats — volatile so the SWD watch window can inspect them live.
+extern volatile uint32_t RingBuffer_PackedState_stress_pushes;
+extern volatile uint32_t RingBuffer_PackedState_stress_drops;
+extern volatile uint32_t RingBuffer_PackedState_stress_pops;
+extern volatile uint32_t RingBuffer_PackedState_stress_seq_errors;
+#endif
+
+// Convenience macro: runs Layer 1 selftest + arms Layer 2 stress test + enters
+// the consumer loop forever. `idle_expr` is expanded inline at the top of each
+// iteration — typically a watchdog refresh. When RB_ENABLE_RUNTIME_TESTS=0
+// the macro expands to a no-op, so the surrounding code can leave the call
+// site unguarded and falls through to production logic.
+#if RB_ENABLE_RUNTIME_TESTS
+	#define RB_RUN_RUNTIME_TESTS(idle_expr)                          \
+		do {                                                         \
+			RingBuffer_PackedState_runtime_tests_init();             \
+			for (;;) {                                               \
+				(idle_expr);                                         \
+				RingBuffer_PackedState_stress_consumer_tick();       \
+			}                                                        \
+		} while (0)
+#else
+	#define RB_RUN_RUNTIME_TESTS(idle_expr)  do { } while (0)
+#endif
+
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
