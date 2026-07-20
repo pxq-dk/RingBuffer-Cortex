@@ -4,7 +4,7 @@
  *  Created on: 18. apr. 2026
  *      Author: Erik Nørskov
  *
- *  Copyright (c) 2026 PxQ Technologies
+ *  Copyright (c) 2026 Erik Nørskov / PxQ Technologies
  *  https://pxq.dk
  *
  *  Dual License:
@@ -26,12 +26,20 @@
  *     or via direct delivery by Erik Nørskov as part of a paid engagement
  *     (in which case the license is granted for that specific project scope only).
  *
+ *     Each commercial license covers only the version of the software
+ *     actually delivered into the licensee's project by the licensor.
+ *     Later versions become covered only when likewise delivered as
+ *     part of a paid engagement or written agreement, or when the
+ *     licensee obtains a separate paid license for that later version.
+ *     The licensee may not substitute or upgrade the software to any
+ *     later version on their own initiative without such a license.
+ *
  *     Contact: https://pxq.dk
  */
 
 #pragma once
 
-inline constexpr const char* RINGBUFFER_PACKEDSTATE_VERSION = "1.3.1";
+inline constexpr const char* RINGBUFFER_PACKEDSTATE_VERSION = "1.3.2";
 
 // Master switch for the runtime test code (Layer 1 selftest + Layer 2 stress
 // test). Set to 0 to remove all test definitions, declarations, and the

@@ -1,8 +1,44 @@
 /*
  * RingBuffer_PackedState.cpp
  *
- *  Runtime self-test for RingBuffer_PackedState. License terms: see the
- *  GPLv3 + commercial dual-license header in RingBuffer_PackedState.h.
+ *  Created on: 18. maj 2026
+ *      Author: Erik Nørskov
+ *
+ *  Copyright (c) 2026 Erik Nørskov / PxQ Technologies
+ *  https://pxq.dk
+ *
+ *  Dual License:
+ *
+ *  1. GNU General Public License v3.0 (GPLv3)
+ *     This file is free software: you can redistribute it and/or modify
+ *     it under the terms of the GNU General Public License as published by
+ *     the Free Software Foundation, version 3 of the License.
+ *
+ *     This file is distributed in the hope that it will be useful,
+ *     but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+ *     General Public License for more details: https://www.gnu.org/licenses/
+ *
+ *  2. Commercial License
+ *     For use in proprietary or closed-source products that cannot or
+ *     do not wish to comply with the GPLv3, a separate commercial license
+ *     is available from PxQ Technologies — either as a written agreement,
+ *     or via direct delivery by Erik Nørskov as part of a paid engagement
+ *     (in which case the license is granted for that specific project scope only).
+ *
+ *     Each commercial license covers only the version of the software
+ *     actually delivered into the licensee's project by the licensor.
+ *     Later versions become covered only when likewise delivered as
+ *     part of a paid engagement or written agreement, or when the
+ *     licensee obtains a separate paid license for that later version.
+ *     The licensee may not substitute or upgrade the software to any
+ *     later version on their own initiative without such a license.
+ *
+ *     Contact: https://pxq.dk
+ */
+
+/*
+ *  Runtime self-test for RingBuffer_PackedState.
  *
  *  The compile-time test suite (unit_test_ringbuffer::run_test) verifies
  *  logical correctness via static_assert. This runtime entry point reuses
