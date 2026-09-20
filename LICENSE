@@ -1,5 +1,6 @@
 Copyright (c) 2026 Erik Nørskov / PxQ Technologies
 https://pxq.dk
+License revision 1.1 - 2026-09-20
 
 
 DUAL LICENSE
@@ -28,6 +29,24 @@ This software is dual-licensed:
    separate paid license for that later version. The licensee may not
    substitute or upgrade the software to any later version on their own
    initiative without such a license.
+
+   Permitted modification: a commercial license permits the licensee to
+   make minimal corrective changes to the delivered version - fixing
+   defects, and configuring the software through the documented
+   integration/porting mechanism (for example, the user-configuration
+   header a library ships for that purpose).
+
+   It does not permit adding functionality, extending the software to new
+   use cases, projects or products, restructuring or refactoring it, or
+   creating derivative works. Where the boundary is unclear, the test is
+   whether the change makes the software do something it was not already
+   delivered to do - if it does, it is not a permitted modification and
+   requires a separate agreement.
+
+   Corrections remain subject to this license, confer no ownership in the
+   software, and may not be redistributed separately. The licensee shall
+   inform the licensor of any correction made, so it can be considered
+   for the upstream version.
 
    Contact: https://pxq.dk
 
