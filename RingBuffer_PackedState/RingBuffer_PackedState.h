@@ -13,7 +13,8 @@
  *  proprietary use. A commercial license covers only the version actually
  *  delivered by the licensor; it permits defect fixes and documented
  *  configuration only, not new functionality, new use cases, or derivative
- *  works. Full terms: LICENSE, or https://pxq.dk
+ *  works. Full terms: LICENSE (GPLv3) and COMMERCIAL-LICENSE.md, or
+ *  https://pxq.dk
  */
 
 #pragma once
