@@ -399,18 +399,40 @@ class RingBuffer_PackedState
 	// (state is alignas(4), same layout). Volatile only when the policy requires it
 	// (ISR concurrency possible) — otherwise the compiler is free to CSE repeated reads.
 	// At compile time: two separate reads (reinterpret_cast not allowed in constexpr).
-	RB_OPT_INLINE constexpr StateSnapshot readHT() const {
+	// The whole state word in one 32-bit LDR: head in bits 0..15, tail in 16..31
+	// (little-endian, state is alignas(4)).
+	RB_OPT_INLINE constexpr uint32_t readRaw() const {
 		if (RB_IS_CONSTANT_EVALUATED()) {
-			return { static_cast<uint16_t>(state.head), static_cast<uint16_t>(state.tail) };
+			return static_cast<uint32_t>(static_cast<uint16_t>(state.head))
+			     | (static_cast<uint32_t>(static_cast<uint16_t>(state.tail)) << 16);
 		}
 		typedef uint32_t __attribute__((may_alias)) u32_alias;
-		uint32_t raw;
 		if constexpr (IrqPolicy::needs_volatile) {
-			raw = *reinterpret_cast<const volatile u32_alias*>(&state);
+			return *reinterpret_cast<const volatile u32_alias*>(&state);
 		} else {
-			raw = *reinterpret_cast<const u32_alias*>(&state);
+			return *reinterpret_cast<const u32_alias*>(&state);
 		}
+	}
+
+	RB_OPT_INLINE constexpr StateSnapshot readHT() const {
+		uint32_t raw = readRaw();
 		return { static_cast<uint16_t>(raw), static_cast<uint16_t>(raw >> 16) };
+	}
+
+	// Empty test on the raw word, without extracting head and tail first.
+	// Extracting both (uxth + lsr) and keeping copies alive cost pop() a stack
+	// frame ({r4, r5, lr} on M33 at -Os); these forms need no extra registers.
+	//   Thumb-2 (M3/M4/M7/M33): head == tail  <=>  word == rotr(word, 16)
+	//                            -> a single `cmp rX, rX, ror #16`.
+	//   ARMv6-M (M0/M0+):        no shifted operands; ((w ^ (w >> 16)) & 0xFFFF) == 0
+	//                            measured 2 instructions shorter there.
+	// Both are exact for any word (tail and head are each 16 bits).
+	RB_OPT_INLINE static constexpr bool rawEmpty(uint32_t w) {
+#if defined(__ARM_ARCH_ISA_THUMB) && (__ARM_ARCH_ISA_THUMB >= 2)
+		return w == ((w >> 16) | (w << 16));
+#else
+		return ((w ^ (w >> 16)) & 0xFFFFu) == 0;
+#endif
 	}
 
 	RB_OPT_INLINE constexpr uint16_t nextIndex(uint16_t idx) const {
@@ -450,22 +472,23 @@ class RingBuffer_PackedState
 
 	RB_OPT_INLINE constexpr bool pop(T& item) {
 		ConsumerGuard g;
-		auto s = readHT();
-		if (s.head == s.tail) [[unlikely]] return false; // empty
+		uint32_t w = readRaw();
+		if (rawEmpty(w)) [[unlikely]] return false;      // empty
+		uint16_t t = static_cast<uint16_t>(w >> 16);
 		acquire_barrier();
-		item = buffer[s.tail];
+		item = buffer[t];
 		release_barrier();
-		state.tail = nextIndex(s.tail);                  // single STRH
+		state.tail = nextIndex(t);                       // single STRH
 		return true;
 	}
 
-	// Returns the next element without advancing tail. Uses readHT() for an atomic
-	// snapshot of head and tail, so the empty check and read index are always consistent.
+	// Returns the next element without advancing tail. Uses one 32-bit snapshot
+	// of head and tail, so the empty check and read index are always consistent.
 	RB_OPT_INLINE constexpr bool peek(T& item) const {
-		auto s = readHT();
-		if (s.head == s.tail) [[unlikely]] return false;
+		uint32_t w = readRaw();
+		if (rawEmpty(w)) [[unlikely]] return false;
 		acquire_barrier();
-		item = buffer[s.tail];
+		item = buffer[static_cast<uint16_t>(w >> 16)];
 		return true;
 	}
 
@@ -539,7 +562,7 @@ class RingBuffer_PackedState
 	}
 
 	RB_OPT_INLINE constexpr bool   isFull()   const { auto s = readHT(); return nextIndex(s.head) == s.tail; }
-	RB_OPT_INLINE constexpr bool   isEmpty()  const { auto s = readHT(); return s.head == s.tail; }
+	RB_OPT_INLINE constexpr bool   isEmpty()  const { return rawEmpty(readRaw()); }
 
 	// Resets the buffer to empty (head = tail = 0) with ONE 32-bit store, so no
 	// other context can ever observe a half-cleared state — no IRQ lock needed
