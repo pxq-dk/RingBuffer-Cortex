@@ -19,7 +19,7 @@
 
 #pragma once
 
-inline constexpr const char* RINGBUFFER_PACKEDSTATE_VERSION = "1.3.2";
+inline constexpr const char* RINGBUFFER_PACKEDSTATE_VERSION = "1.3.3";
 
 // Master switch for the runtime test code (Layer 1 selftest + Layer 2 stress
 // test). Set to 0 to remove all test definitions, declarations, and the
@@ -76,6 +76,7 @@ extern volatile uint32_t RingBuffer_PackedState_stress_seq_errors;
 #include <cstddef>
 #include <cstring>
 #include <type_traits>
+#include <atomic>      // std::atomic_signal_fence (non-GNU fallback only)
 
 #if defined(__GNUC__) || defined(__clang__)
 	#define RB_OPT        [[gnu::optimize("Os")]]
@@ -83,6 +84,15 @@ extern volatile uint32_t RingBuffer_PackedState_stress_seq_errors;
 #else
 	#define RB_OPT
 	#define RB_OPT_INLINE
+#endif
+
+// The builtin folds to a constant even at -O0. std::is_constant_evaluated() is
+// a libstdc++ wrapper that, in -O0 Debug builds, is emitted as a real
+// `bl std::is_constant_evaluated` + compare + branch at every inlined use.
+#if defined(__GNUC__) || defined(__clang__)
+	#define RB_IS_CONSTANT_EVALUATED() __builtin_is_constant_evaluated()
+#else
+	#define RB_IS_CONSTANT_EVALUATED() std::is_constant_evaluated()
 #endif
 
 
@@ -294,11 +304,46 @@ class RingBuffer_PackedState
 	static constexpr bool is_power_of_two = (Size & (Size - 1)) == 0;
 
 	using half_type    = std::conditional_t<IrqPolicy::needs_volatile, volatile uint16_t, uint16_t>;
-	using element_type = std::conditional_t<IrqPolicy::needs_volatile, volatile T, T>;
+
+	// Elements are deliberately NOT volatile (since 1.3.3). Each slot is owned by
+	// exactly one side at a time (producer between snapshot and head publish,
+	// consumer between snapshot and tail publish), so no access to a slot ever
+	// races. What must be guaranteed is ORDER relative to the volatile index
+	// accesses — and volatile on the elements could not give that to memcpy or to
+	// user code writing through a zero-copy pointer with volatile cast away.
+	// The order is enforced by acquire_barrier() / release_barrier() below.
+	using element_type = T;
 
 	// Adjacent halfwords — head written by producer (STRH), tail written by consumer (STRH).
 	alignas(4) struct { half_type head; half_type tail; } state;
 	alignas(alignof(T)) element_type buffer[Size];
+
+	// Compiler barriers ordering element accesses against the index accesses.
+	// On single-core Cortex-M an ISR observes memory in program order, so a
+	// compiler-only barrier (no DMB) is sufficient for ISR <-> thread sharing.
+	// Zero instructions are emitted; they only stop GCC from moving memory
+	// accesses across them. Compiled out for Topology::None.
+	//
+	// acquire_barrier(): after readHT() — element accesses must not be hoisted
+	//   above the snapshot that proved the slots belong to this side.
+	// release_barrier(): before publishing head/tail — element accesses must be
+	//   complete before the other side can see the slots handed over.
+	//
+	// A full "memory" clobber was measured smaller than an asm scoped to
+	// "+m"(buffer), "+m"(state) — both at -O2 and in the -O0 Debug build.
+	RB_OPT_INLINE static constexpr void compiler_barrier() {
+		if constexpr (IrqPolicy::needs_volatile) {
+			if (!RB_IS_CONSTANT_EVALUATED()) {
+#if defined(__GNUC__) || defined(__clang__)
+				__asm__ volatile("" ::: "memory");
+#else
+				std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
+			}
+		}
+	}
+	RB_OPT_INLINE static constexpr void acquire_barrier() { compiler_barrier(); }
+	RB_OPT_INLINE static constexpr void release_barrier() { compiler_barrier(); }
 
 	// Non-volatile snapshot — same layout as state, always uint16_t regardless of IrqPolicy.
 	struct StateSnapshot { uint16_t head; uint16_t tail; };
@@ -308,7 +353,7 @@ class RingBuffer_PackedState
 	// (ISR concurrency possible) — otherwise the compiler is free to CSE repeated reads.
 	// At compile time: two separate reads (reinterpret_cast not allowed in constexpr).
 	RB_OPT_INLINE constexpr StateSnapshot readHT() const {
-		if (std::is_constant_evaluated()) {
+		if (RB_IS_CONSTANT_EVALUATED()) {
 			return { static_cast<uint16_t>(state.head), static_cast<uint16_t>(state.tail) };
 		}
 		typedef uint32_t __attribute__((may_alias)) u32_alias;
@@ -349,7 +394,9 @@ class RingBuffer_PackedState
 		auto s          = readHT();
 		uint16_t next_h = nextIndex(s.head);
 		if (next_h == s.tail) [[unlikely]] return false; // full
+		acquire_barrier();
 		buffer[s.head] = item;
+		release_barrier();
 		state.head = next_h;                             // single STRH
 		return true;
 	}
@@ -358,7 +405,9 @@ class RingBuffer_PackedState
 		ConsumerGuard g;
 		auto s = readHT();
 		if (s.head == s.tail) [[unlikely]] return false; // empty
+		acquire_barrier();
 		item = buffer[s.tail];
+		release_barrier();
 		state.tail = nextIndex(s.tail);                  // single STRH
 		return true;
 	}
@@ -368,7 +417,8 @@ class RingBuffer_PackedState
 	RB_OPT_INLINE constexpr bool peek(T& item) const {
 		auto s = readHT();
 		if (s.head == s.tail) [[unlikely]] return false;
-		item = static_cast<T>(buffer[s.tail]);
+		acquire_barrier();
+		item = buffer[s.tail];
 		return true;
 	}
 
@@ -380,7 +430,8 @@ class RingBuffer_PackedState
 		size_t available = wrapSize((uint32_t)s.head - (uint32_t)s.tail + Size);
 		if (offset >= available) [[unlikely]] return false;
 		size_t idx = wrapSize((uint32_t)s.tail + offset);
-		item = static_cast<T>(buffer[idx]);
+		acquire_barrier();
+		item = buffer[idx];
 		return true;
 	}
 
@@ -394,15 +445,15 @@ class RingBuffer_PackedState
 		if (count > available) count = available;
 		size_t first = Size - h;
 		if (first > count) first = count;
+		acquire_barrier();
 		if constexpr (std::is_trivially_copyable_v<T>) {
-			// volatile stripped via const_cast — safe for SRAM: memcpy always
-			// generates actual stores regardless of the volatile qualifier.
-			memcpy(const_cast<T*>(&buffer[h]),  ptr,         first           * sizeof(T));
-			memcpy(const_cast<T*>(&buffer[0]),  ptr + first, (count - first) * sizeof(T));
+			memcpy(&buffer[h], ptr,         first           * sizeof(T));
+			memcpy(&buffer[0], ptr + first, (count - first) * sizeof(T));
 		} else {
 			for (size_t i = 0; i < first; ++i)        buffer[h + i] = ptr[i];
 			for (size_t i = 0; i < count - first; ++i) buffer[i]    = ptr[first + i];
 		}
+		release_barrier();
 		uint32_t h32 = (uint32_t)h + count;
 		if constexpr (is_power_of_two)
 			h = static_cast<uint16_t>(h32 & (Size - 1));
@@ -422,15 +473,15 @@ class RingBuffer_PackedState
 		if (count > available) count = available;
 		size_t first = Size - t;
 		if (first > count) first = count;
+		acquire_barrier();
 		if constexpr (std::is_trivially_copyable_v<T>) {
-			// volatile stripped via const_cast — safe for SRAM: memcpy always
-			// generates actual loads regardless of the volatile qualifier.
-			memcpy(ptr,         const_cast<const T*>(&buffer[t]), first           * sizeof(T));
-			memcpy(ptr + first, const_cast<const T*>(&buffer[0]), (count - first) * sizeof(T));
+			memcpy(ptr,         &buffer[t], first           * sizeof(T));
+			memcpy(ptr + first, &buffer[0], (count - first) * sizeof(T));
 		} else {
-			for (size_t i = 0; i < first; ++i)        ptr[i]        = static_cast<T>(buffer[t + i]);
-			for (size_t i = 0; i < count - first; ++i) ptr[first + i] = static_cast<T>(buffer[i]);
+			for (size_t i = 0; i < first; ++i)        ptr[i]        = buffer[t + i];
+			for (size_t i = 0; i < count - first; ++i) ptr[first + i] = buffer[i];
 		}
+		release_barrier();
 		uint32_t t32 = (uint32_t)t + count;
 		if constexpr (is_power_of_two)
 			t = static_cast<uint16_t>(t32 & (Size - 1));
@@ -484,6 +535,7 @@ class RingBuffer_PackedState
 		size_t   contiguous = Size - h;
 		if (contiguous > available) contiguous = available;
 		if (contiguous > max_size)  contiguous = max_size;
+		acquire_barrier();                                   // caller's writes stay after the snapshot
 		return { &buffer[h], contiguous };
 	}
 
@@ -498,6 +550,7 @@ class RingBuffer_PackedState
 			h = static_cast<uint16_t>(h32 & (Size - 1));
 		else
 			h = static_cast<uint16_t>(h32 >= Size ? h32 - Size : h32);
+		release_barrier();                                   // caller's writes complete before publish
 		state.head = h;                                      // single STRH
 	}
 
@@ -510,6 +563,7 @@ class RingBuffer_PackedState
 		size_t   contiguous = Size - t;
 		if (contiguous > available) contiguous = available;
 		if (contiguous > max_size)  contiguous = max_size;
+		acquire_barrier();                                   // caller's reads stay after the snapshot
 		return { &buffer[t], contiguous };
 	}
 
@@ -524,6 +578,7 @@ class RingBuffer_PackedState
 			t = static_cast<uint16_t>(t32 & (Size - 1));
 		else
 			t = static_cast<uint16_t>(t32 >= Size ? t32 - Size : t32);
+		release_barrier();                                   // caller's reads complete before publish
 		state.tail = t;                                      // single STRH
 	}
 
@@ -568,3 +623,4 @@ class RingBuffer_PackedState
 
 #undef RB_OPT
 #undef RB_OPT_INLINE
+#undef RB_IS_CONSTANT_EVALUATED
