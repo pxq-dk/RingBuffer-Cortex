@@ -78,12 +78,27 @@ extern volatile uint32_t RingBuffer_PackedState_stress_seq_errors;
 #include <type_traits>
 #include <atomic>      // std::atomic_signal_fence (non-GNU fallback only)
 
+// Forced -Os on the library, independent of the project's optimisation level.
+// Purpose: keep the buffer fast and small in -O0 Debug builds, where it often
+// runs in ISRs. Measured 2026-11-07 (STM32G071, whole project at -O0):
+// without these attributes single push()/pop() were 3-4x slower; with
+// always_inline alone ~2x slower (the inlined code is then unoptimised).
+// At -Os they are equal or better; at -O2 dropping them gains only 5-20 cycles.
+// Side effect to remember: GCC does not inline a function with different
+// optimisation settings unless it is always_inline. Every helper used inside
+// an RB_OPT function must therefore be RB_OPT_INLINE (see ActiveGuard/NoGuard).
+//
+// RB_OPT_COPY: RB_OPT for push_n()/pop_n(), plus no-tree-loop-distribute-patterns
+// so GCC keeps the element loop instead of turning it back into memcpy calls
+// (newlib-nano memcpy is a byte loop too, plus call overhead - measured slower).
 #if defined(__GNUC__) || defined(__clang__)
 	#define RB_OPT        [[gnu::optimize("Os")]]
 	#define RB_OPT_INLINE [[gnu::optimize("Os"), gnu::always_inline]]
+	#define RB_OPT_COPY   [[gnu::optimize("Os", "no-tree-loop-distribute-patterns")]]
 #else
 	#define RB_OPT
 	#define RB_OPT_INLINE
+	#define RB_OPT_COPY
 #endif
 
 // The builtin folds to a constant even at -O0. std::is_constant_evaluated() is
@@ -311,6 +326,20 @@ class unit_test_ringbuffer
 		  if (!rb.isFull()) return false;
 		  for (size_t i = 0; i < capacity; ++i) { value_type v{}; rb.pop(v); if (v != static_cast<value_type>(i + 20)) return false; } }
 
+		// push_n/pop_n: clamp to free space / available count, wrap, FIFO order
+		{ RBType rb;
+		  value_type src[capacity + 2] {}; value_type dst[capacity + 2] {};
+		  for (size_t i = 0; i < capacity + 2; ++i) src[i] = static_cast<value_type>(i + 30);
+		  if (rb.push_n(src, capacity + 2) != capacity) return false;        // clamped to free space
+		  if (!rb.isFull()) return false;
+		  if (rb.pop_n(dst, 2) != 2) return false;
+		  if (dst[0] != static_cast<value_type>(30) || dst[1] != static_cast<value_type>(31)) return false;
+		  if (rb.push_n(src, 2) != 2) return false;                          // head wraps
+		  if (rb.pop_n(dst, capacity + 2) != capacity) return false;         // clamped to count, tail wraps
+		  for (size_t i = 0; i < capacity - 2; ++i) if (dst[i] != static_cast<value_type>(i + 32)) return false;
+		  if (dst[capacity - 2] != static_cast<value_type>(30) || dst[capacity - 1] != static_cast<value_type>(31)) return false;
+		  if (!rb.isEmpty() || rb.pop_n(dst, 1) != 0) return false; }
+
 		// FIFO order must be maintained across a wrap-around
 		{ RBType rb;
 		  for (size_t i = 0; i < capacity; ++i) rb.push(static_cast<value_type>(i + 1));
@@ -333,16 +362,22 @@ class RingBuffer_PackedState
 	static_assert(Size >= 2 && Size <= 65535, "RingBuffer_PackedState: Size must be in range [2, 65535]");
 
 	private:
-	template<bool Active>
-	struct GuardImpl {
+	// Two separate guard types instead of one with `if constexpr` inside:
+	// the old single GuardImpl<false> still had a user-provided destructor, and
+	// as a non-RB_OPT_INLINE function it was not inlined into RB_OPT functions
+	// in -O0 builds - push_n() made a real call to an EMPTY destructor and had to
+	// save 8 instead of 5 registers. NoGuard is trivially destructible, so there
+	// is nothing to call; ActiveGuard's lock/unlock are forced inline.
+	struct ActiveGuard {
 		uint32_t primask;
-		static constexpr uint32_t do_lock() {
-			if constexpr (Active) return IrqPolicy::lock();
-			else return 0;
-		}
-		constexpr GuardImpl()  : primask(do_lock()) {}
-		constexpr ~GuardImpl() { if constexpr (Active) IrqPolicy::unlock(primask); }
+		RB_OPT_INLINE constexpr ActiveGuard()  : primask(IrqPolicy::lock()) {}
+		RB_OPT_INLINE constexpr ~ActiveGuard() { IrqPolicy::unlock(primask); }
 	};
+	struct NoGuard {
+		RB_OPT_INLINE constexpr NoGuard() noexcept {}
+	};
+	template<bool Active>
+	using GuardImpl = std::conditional_t<Active, ActiveGuard, NoGuard>;
 	using ProducerGuard = GuardImpl<IrqPolicy::lock_p_needed>;
 	using ConsumerGuard = GuardImpl<IrqPolicy::lock_c_needed>;
 	// clear() writes both fields, so it must exclude every side that has a lock.
@@ -356,8 +391,8 @@ class RingBuffer_PackedState
 	// exactly one side at a time (producer between snapshot and head publish,
 	// consumer between snapshot and tail publish), so no access to a slot ever
 	// races. What must be guaranteed is ORDER relative to the volatile index
-	// accesses — and volatile on the elements could not give that to memcpy or to
-	// user code writing through a zero-copy pointer with volatile cast away.
+	// accesses — and volatile on the elements could not give that to a bulk copy
+	// or to user code writing through a zero-copy pointer with volatile cast away.
 	// The order is enforced by acquire_barrier() / release_barrier() below.
 	using element_type = T;
 
@@ -508,7 +543,13 @@ class RingBuffer_PackedState
 	// Pushes up to count elements from ptr. Returns the number actually pushed —
 	// may be less than count if space is limited. Handles wrap automatically.
 	// ProducerGuard protected.
-	RB_OPT constexpr size_t push_n(const T* ptr, size_t count) {
+	// Plain element loops, not memcpy (measured on STM32G071, uint8_t, n=4:
+	// 184 -> 134 cycles together with the guard fix): no call overhead, no
+	// second call when nothing wraps (the 2nd loop simply runs 0 times), and
+	// elements of 4 bytes are copied as words anyway. A 32-bit word fast path
+	// for byte buffers was measured too and rejected: it only wins for large
+	// blocks with matching alignment, is much slower otherwise, +216 B flash.
+	RB_OPT_COPY constexpr size_t push_n(const T* ptr, size_t count) {
 		ProducerGuard g;
 		auto [h, t] = readHT();
 		size_t available = wrapSize((uint32_t)t + Size - (uint32_t)h - 1);
@@ -516,13 +557,8 @@ class RingBuffer_PackedState
 		size_t first = Size - h;
 		if (first > count) first = count;
 		acquire_barrier();
-		if constexpr (std::is_trivially_copyable_v<T>) {
-			memcpy(&buffer[h], ptr,         first           * sizeof(T));
-			memcpy(&buffer[0], ptr + first, (count - first) * sizeof(T));
-		} else {
-			for (size_t i = 0; i < first; ++i)        buffer[h + i] = ptr[i];
-			for (size_t i = 0; i < count - first; ++i) buffer[i]    = ptr[first + i];
-		}
+		for (size_t i = 0; i < first; ++i)         buffer[h + i] = ptr[i];
+		for (size_t i = 0; i < count - first; ++i) buffer[i]     = ptr[first + i];
 		release_barrier();
 		uint32_t h32 = (uint32_t)h + count;
 		if constexpr (is_power_of_two)
@@ -535,8 +571,8 @@ class RingBuffer_PackedState
 
 	// Pops up to count elements into ptr. Returns the number actually popped —
 	// may be less than count if fewer elements are available. Handles wrap automatically.
-	// ConsumerGuard protected.
-	RB_OPT constexpr size_t pop_n(T* ptr, size_t count) {
+	// ConsumerGuard protected. Plain element loops, see push_n().
+	RB_OPT_COPY constexpr size_t pop_n(T* ptr, size_t count) {
 		ConsumerGuard g;
 		auto [h, t] = readHT();
 		size_t available = wrapSize((uint32_t)h - (uint32_t)t + Size);
@@ -544,13 +580,8 @@ class RingBuffer_PackedState
 		size_t first = Size - t;
 		if (first > count) first = count;
 		acquire_barrier();
-		if constexpr (std::is_trivially_copyable_v<T>) {
-			memcpy(ptr,         &buffer[t], first           * sizeof(T));
-			memcpy(ptr + first, &buffer[0], (count - first) * sizeof(T));
-		} else {
-			for (size_t i = 0; i < first; ++i)        ptr[i]        = buffer[t + i];
-			for (size_t i = 0; i < count - first; ++i) ptr[first + i] = buffer[i];
-		}
+		for (size_t i = 0; i < first; ++i)         ptr[i]         = buffer[t + i];
+		for (size_t i = 0; i < count - first; ++i) ptr[first + i] = buffer[i];
 		release_barrier();
 		uint32_t t32 = (uint32_t)t + count;
 		if constexpr (is_power_of_two)
@@ -710,4 +741,5 @@ class RingBuffer_PackedState
 
 #undef RB_OPT
 #undef RB_OPT_INLINE
+#undef RB_OPT_COPY
 #undef RB_IS_CONSTANT_EVALUATED
