@@ -266,6 +266,18 @@ class unit_test_ringbuffer
 		  rb.commit_pop(area2.count);
 		  if (rb.getCount() != 0) return false; }
 
+		// clear(): empties a partly filled, wrapped buffer; full capacity and FIFO work afterwards
+		{ RBType rb;
+		  for (size_t i = 0; i < capacity; ++i) rb.push(static_cast<value_type>(i + 1));
+		  { value_type v{}; rb.pop(v); }
+		  rb.push(static_cast<value_type>(9));                       // head has wrapped
+		  rb.clear();
+		  if (!rb.isEmpty() || rb.getCount() != 0) return false;
+		  { value_type v{}; if (rb.pop(v)) return false; }
+		  for (size_t i = 0; i < capacity; ++i) if (!rb.push(static_cast<value_type>(i + 20))) return false;
+		  if (!rb.isFull()) return false;
+		  for (size_t i = 0; i < capacity; ++i) { value_type v{}; rb.pop(v); if (v != static_cast<value_type>(i + 20)) return false; } }
+
 		// FIFO order must be maintained across a wrap-around
 		{ RBType rb;
 		  for (size_t i = 0; i < capacity; ++i) rb.push(static_cast<value_type>(i + 1));
@@ -300,6 +312,8 @@ class RingBuffer_PackedState
 	};
 	using ProducerGuard = GuardImpl<IrqPolicy::lock_p_needed>;
 	using ConsumerGuard = GuardImpl<IrqPolicy::lock_c_needed>;
+	// clear() writes both fields, so it must exclude every side that has a lock.
+	using ClearGuard    = GuardImpl<IrqPolicy::lock_p_needed || IrqPolicy::lock_c_needed>;
 
 	static constexpr bool is_power_of_two = (Size & (Size - 1)) == 0;
 
@@ -494,14 +508,31 @@ class RingBuffer_PackedState
 	RB_OPT_INLINE constexpr bool   isFull()   const { auto s = readHT(); return nextIndex(s.head) == s.tail; }
 	RB_OPT_INLINE constexpr bool   isEmpty()  const { auto s = readHT(); return s.head == s.tail; }
 
-	// Resets the buffer to empty. Writes both head and tail — not safe to call
-	// while a DMA transfer is active on this buffer; stop the DMA first.
-	// Always acquires a lock regardless of topology since both fields are written.
-	void clear() {
-		uint32_t p = IrqPolicy::lock();
-		state.head = 0;
-		state.tail = 0;
-		IrqPolicy::unlock(p);
+	// Resets the buffer to empty (head = tail = 0) with ONE 32-bit store, so no
+	// other context can ever observe a half-cleared state — no IRQ lock needed
+	// for that. A lock is taken only in topologies where a side already locks
+	// (MPSC/SPMC/MPMC), so clear() also waits out an in-progress guarded op
+	// when LockImpl is a preemptible lock (e.g. an RTOS mutex).
+	//
+	// Call contract — clear() overwrites the OTHER side's field too:
+	//   SAFE   from the lowest-priority context sharing the buffer (typically
+	//          main): an ISR on the other side runs to completion, so it can
+	//          never be caught mid-operation by the store.
+	//   SAFE   whenever the other side is quiescent (init, ISR disabled).
+	//   UNSAFE from an ISR that can preempt an UNGUARDED side mid-push/pop:
+	//          that side then writes its stale index back after the clear and
+	//          corrupts the count. No lock inside clear() can prevent this,
+	//          because the unguarded side never takes the lock.
+	// Not safe while DMA is active on the buffer; stop the DMA first.
+	RB_OPT_INLINE constexpr void clear() {
+		if (RB_IS_CONSTANT_EVALUATED()) { state.head = 0; state.tail = 0; return; }
+		ClearGuard g;
+		release_barrier();   // finish element accesses before slots are handed back
+		typedef uint32_t __attribute__((may_alias)) u32_alias;
+		if constexpr (IrqPolicy::needs_volatile)
+			*reinterpret_cast<volatile u32_alias*>(&state) = 0;   // single STR
+		else
+			*reinterpret_cast<u32_alias*>(&state) = 0;
 	}
 
 	RB_OPT_INLINE constexpr size_t getCount() const {
