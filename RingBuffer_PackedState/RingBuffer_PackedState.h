@@ -19,7 +19,7 @@
 
 #pragma once
 
-inline constexpr const char* RINGBUFFER_PACKEDSTATE_VERSION = "1.3.3";
+inline constexpr const char* RINGBUFFER_PACKEDSTATE_VERSION = "1.4.0";
 
 // Master switch for the runtime test code (Layer 1 selftest + Layer 2 stress
 // test). Set to 0 to remove all test definitions, declarations, and the
@@ -182,6 +182,14 @@ struct Topology {
 		static constexpr bool lock_p_needed  = false;
 		static constexpr bool lock_c_needed  = true;
 	};
+
+	// Internal marker — NOT a sixth topology; never write it yourself.
+	// It is the default when no topology is given, and behaves exactly like
+	// None. It exists only so the library can tell "omitted" apart from an
+	// explicit None<> and emit a deprecation warning (1.4.0). Removed in 2.0,
+	// when the topology argument becomes mandatory.
+	template<typename LockImpl = PrimaskLock>
+	struct Unspecified_ : None<LockImpl> {};
 
 	// Multiple Producers, Multiple Consumers — both sides guarded.
 	template<typename LockImpl = PrimaskLock>
@@ -352,11 +360,24 @@ class unit_test_ringbuffer
 	}
 };
 
+// Emitted (as a deprecation warning, pointing at the user's line) when a
+// RingBuffer_PackedState is declared without a topology. A template so that
+// it is only checked when actually used: a non-template call would be looked
+// up when the header is parsed and warn every user (two-phase lookup).
+template<typename Policy>
+[[deprecated("RingBuffer_PackedState: no topology given - defaulting to Topology::None<> "
+             "(single context, NOT interrupt-safe). Pass it explicitly: Topology::None<>, "
+             "SPSC<> (e.g. ISR -> main), MPSC<>, SPMC<> or MPMC<>. "
+             "The default is removed in 2.0.")]]
+constexpr void RingBuffer_PackedState_topology_not_specified() {}
+
 // Optimised ring buffer with head and tail as adjacent volatile uint16_t fields.
 // Reads are LDRH, writes are STRH — in SPSC each side owns one field exclusively.
 // One slot is sacrificed to distinguish full from empty without a count variable.
 // Effective capacity is Size-1.
-template<typename T, size_t Size, typename IrqPolicy = Topology::None<>, bool _IsTestInstance = false>
+// IrqPolicy: always pass it explicitly (see Topology). Omitting it still means
+// None (unchanged behaviour) but is deprecated since 1.4.0 and fails in 2.0.
+template<typename T, size_t Size, typename IrqPolicy = Topology::Unspecified_<>, bool _IsTestInstance = false>
 class RingBuffer_PackedState
 {
 	static_assert(Size >= 2 && Size <= 65535, "RingBuffer_PackedState: Size must be in range [2, 65535]");
@@ -486,6 +507,8 @@ class RingBuffer_PackedState
 
 	constexpr RingBuffer_PackedState() : state{}, buffer{}
 	{
+		if constexpr (std::is_same_v<IrqPolicy, Topology::Unspecified_<>>)
+			RingBuffer_PackedState_topology_not_specified<IrqPolicy>();
 		if constexpr (!_IsTestInstance)
 		{
 			using test_type = RingBuffer_PackedState<T, 4, Topology::None<>, true>;

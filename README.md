@@ -10,7 +10,7 @@ ISR-safe, DMA-friendly ring buffer for ARM Cortex-M — LDRH/STRH per field, pol
 
 Most Cortex-M ring buffers use word-sized (`size_t` / `uint32_t`) indices with `std::atomic` or plain `volatile`, and either require power-of-2 sizes or silently call `__aeabi_uidivmod` on wrap. This one takes a different set of micro-architectural decisions:
 
-- **Lock-free SPSC without `std::atomic`** — head and tail are packed as two `uint16_t` fields in a 4-byte-aligned struct. The producer `STRH` at offset 0 and the consumer `STRH` at offset 2 target different bus addresses — they cannot collide. No libatomic calls, no fences.
+- **Lock-free SPSC without `std::atomic`** — head and tail are packed as two `uint16_t` fields in a 4-byte-aligned struct. The producer `STRH` at offset 0 and the consumer `STRH` at offset 2 target different bus addresses — they cannot collide. No libatomic calls, no hardware fences — ordering is enforced by zero-instruction compiler barriers.
 - **Single-LDR state snapshot** — both indices read in one 32-bit bus transaction (`readHT()`). Other libraries do two separate reads or rely on atomic word-sized indices.
 - **Topology-selectable IRQ protection** — `None` / `SPSC` / `MPSC` / `SPMC` / `MPMC` chosen per-instance, with producer and consumer guards independent (MPSC pays no guard on `pop`, SPMC pays none on `push`).
 - **No software division on any path** — power-of-2 sizes use `AND`, non-power-of-2 use compare-and-subtract. No `__aeabi_uidivmod` ever emitted.
@@ -23,8 +23,9 @@ Most Cortex-M ring buffers use word-sized (`size_t` / `uint32_t`) indices with `
 ```cpp
 #include "RingBuffer_PackedState/RingBuffer_PackedState.h"
 
-// Basic use — no IRQ protection (this is the default)
-RingBuffer_PackedState<uint8_t, 32> rb;
+// Single context — no concurrency, no IRQ protection.
+// Always pass the topology explicitly (see "Choosing a topology").
+RingBuffer_PackedState<uint8_t, 32, Topology::None<>> rb;
 
 rb.push(42);
 
@@ -50,7 +51,7 @@ RingBuffer_PackedState<uint8_t, 32, Topology::MPMC<FreeRtosLock>> rb_rtos;
 - **Per-field halfword access** — head and tail are stored as adjacent `uint16_t` fields in a 4-byte-aligned struct. All state reads use a single 32-bit `LDR` atomic snapshot (`readHT()`). All state writes use individual `STRH` per field — no read-modify-write of the adjacent halfword.
 - **Lock-free SPSC** — with `Topology::SPSC<>`, the producer writes head (`STRH`) and the consumer writes tail (`STRH`) without any IRQ masking. For example, an ISR pushes and main pops — or vice versa. The two stores target different halfword addresses and never collide.
 - **Policy-based IRQ protection** — choose `Topology::None`, `Topology::SPSC`, `Topology::MPSC`, `Topology::SPMC`, or `Topology::MPMC` as a template argument. Zero overhead when protection is not needed.
-- **Conditional `volatile`** — `state` and `buffer` are automatically `volatile` when `needs_volatile` is true, ensuring the compiler always generates actual loads and stores across ISR boundaries.
+- **Conditional `volatile` + compiler barriers** — the head/tail `state` is `volatile` when `needs_volatile` is true, so every index access is a real load/store. The elements themselves are plain `T`: each slot is owned by one side at a time, and zero-instruction compiler barriers order the element accesses against the index publish (no `DMB` needed for ISR ↔ thread on a single core).
 - **No software division** — power-of-2 sizes use `& (Size-1)`; non-power-of-2 sizes use compare-and-subtract. Both avoid `__aeabi_uidivmod` on Cortex-M0+.
 - **DMA-friendly contiguous area API** — zero-copy access via `get_contiguous_push_area` / `get_contiguous_pop_area` for direct DMA transfers.
 - **Compile-time unit tests** — a `static_assert` in the constructor runs a full test suite at compile time. A broken instantiation will not compile.
@@ -62,7 +63,7 @@ RingBuffer_PackedState<uint8_t, 32, Topology::MPMC<FreeRtosLock>> rb_rtos;
 
 - C++20 or later
 - ARM Cortex-M target (GCC `arm-none-eabi`) or any C++20 compiler for host-side use
-- `__disable_irq()`, `__get_PRIMASK()`, and `__set_PRIMASK()` available when using the built-in `PrimaskLock` (standard CMSIS). Custom protection schemes (RTOS, custom critical sections) can be used by supplying a custom lock — see [IRQ Protection Policies](#irq-protection-policies).
+- No CMSIS headers needed: the built-in `PrimaskLock` uses its own `mrs` / `cpsid i` / `msr` (identical to CMSIS). On non-Cortex-M hosts `None` and `SPSC` build as-is; locking topologies need a custom lock there. Custom protection schemes (RTOS, custom critical sections) can be used by supplying a custom lock — see [IRQ Protection Policies](#irq-protection-policies).
 
 ---
 
@@ -131,7 +132,7 @@ auto out = rb.reserve_pop(32);    // tail advances immediately
 |---|---|---|
 | `T` | — | Element type |
 | `Size` | — | Total buffer slots. Effective capacity is `Size-1`. Must be in range [2, 65535]. |
-| `IrqPolicy` | `Topology::None<>` | IRQ protection policy. See [IRQ Protection Policies](#irq-protection-policies) below. |
+| `IrqPolicy` | none — **pass it explicitly** | IRQ protection policy. See [Choosing a topology](#choosing-a-topology) and [IRQ Protection Policies](#irq-protection-policies) below. Omitting it still means `None` but is deprecated since 1.4.0 (compiler warning) and becomes an error in 2.0. |
 
 ---
 
@@ -150,9 +151,9 @@ auto out = rb.reserve_pop(32);    // tail advances immediately
 | `getCount()` | Returns number of elements currently in buffer. |
 | `getSpace()` | Returns number of free slots remaining. Producer counterpart to `getCount()`. |
 | `skip(count)` | Discards up to `count` elements by advancing tail without reading. Clamped to available data. Alias for `commit_pop()` — use when intent is discard rather than DMA consume. |
-| `push_n(ptr, count)` | Pushes up to `count` elements from `ptr`. Returns number actually pushed. Handles wrap automatically. Uses `memcpy` for trivially copyable types. ProducerGuard protected. |
-| `pop_n(ptr, count)` | Pops up to `count` elements into `ptr`. Returns number actually popped. Handles wrap automatically. Uses `memcpy` for trivially copyable types. ConsumerGuard protected. |
-| `clear()` | Resets buffer to empty. Always IRQ-protected regardless of topology. Do not call while a DMA transfer is active on this buffer — stop the DMA first. |
+| `push_n(ptr, count)` | Pushes up to `count` elements from `ptr`. Returns number actually pushed. Handles wrap automatically. Plain element loop (faster than newlib-nano `memcpy` for typical small blocks). ProducerGuard protected. |
+| `pop_n(ptr, count)` | Pops up to `count` elements into `ptr`. Returns number actually popped. Handles wrap automatically. Plain element loop. ConsumerGuard protected. |
+| `clear()` | Resets buffer to empty with a single 32-bit store (no half-cleared state is ever visible). Locks only in topologies that already lock (MPSC/SPMC/MPMC). It overwrites the other side's index too: call it from the lowest-priority context that uses the buffer (typically main), or while the other side is idle — never from an ISR that can interrupt an unguarded push/pop. Do not call while a DMA transfer is active on this buffer — stop the DMA first. |
 
 ### DMA / contiguous area
 
@@ -168,6 +169,24 @@ auto out = rb.reserve_pop(32);    // tail advances immediately
 > All functions use `readHT()` for their initial state read — a single 32-bit `LDR` atomic snapshot of head and tail, safe across ISR boundaries. Writes back to `state.head` or `state.tail` remain individual `STRH` instructions.
 
 > **Note on `peek` in `SPMC`/`MPMC`:** `peek` does not acquire a `ConsumerGuard`. Another consumer may pop the element between `peek`'s state snapshot and the buffer read, returning logically-stale data (or, for multi-byte `T`, a torn read if the producer wraps and overwrites the slot). For atomic peek-then-act semantics, use `pop` into a local variable instead.
+
+---
+
+## Choosing a topology
+
+Pick the topology from **who calls `push` and who calls `pop`**:
+
+| Producers (`push`) | Consumers (`pop`) | Topology |
+|---|---|---|
+| one context | the same context | `Topology::None<>` |
+| one context (e.g. an ISR) | one *other* context (e.g. main) | `Topology::SPSC<>` |
+| several contexts (e.g. main + ISRs) | one context | `Topology::MPSC<>` |
+| one context | several contexts | `Topology::SPMC<>` |
+| several | several | `Topology::MPMC<>` |
+
+"Context" means main loop, a specific ISR, or an RTOS task. If in doubt between `None` and `SPSC`, choose `SPSC` — the cost is a real `LDRH`/`STRH` per index access, no IRQ masking. `None` with an ISR on either side compiles and usually passes testing, but fails sporadically in the field.
+
+Since 1.4.0 the topology should always be given explicitly. A buffer declared without one (`RingBuffer_PackedState<uint8_t, 32>`) still behaves like `None`, but the compiler emits a deprecation warning pointing at that line. In 2.0 the argument becomes mandatory.
 
 ---
 
@@ -226,7 +245,7 @@ The current design gets the best of both: writes use individual `STRH` per field
 
 All functions that inspect head and tail — `push`, `pop`, `peek`, `isEmpty`, `isFull`, `getCount`, and the contiguous area functions — call `readHT()`, which does a single 32-bit `LDR` from the 4-byte-aligned state struct. This gives a consistent snapshot of both fields from the same moment in time, safe across ISR boundaries. Without it, two separate `LDRH` reads could be split by an ISR and yield a head/tail pair that never existed simultaneously.
 
-At compile time (constexpr unit tests), `std::is_constant_evaluated()` switches `readHT()` to two separate field reads, since `reinterpret_cast` is not permitted in constant expressions.
+At compile time (constexpr unit tests), `__builtin_is_constant_evaluated()` switches `readHT()` to two separate field reads, since `reinterpret_cast` is not permitted in constant expressions. (The builtin, not `std::is_constant_evaluated()`: the latter is a real function call at every use in `-O0` builds.)
 
 **Why `Topology::SPSC<>` instead of `Topology::None<>` for SPSC?**
 
@@ -239,6 +258,20 @@ Distinguishing full from empty without a separate count variable. If `head == ta
 **Why compile-time unit tests?**
 
 A `static_assert` in the constructor runs `unit_test_ringbuffer::run_test()` at compile time against a `Size=4` test instance. If any test fails, the translation unit will not compile — no separate test binary required.
+
+---
+
+## Changes in 1.4.0
+
+All changes are source-compatible except where marked.
+
+- **Fix — element ordering.** `push_n`/`pop_n` copied through a non-`volatile` view and were not formally ordered against the `volatile` index store that publishes them; zero-copy users who cast `volatile` away had the same hole. Element accesses are now ordered by compiler barriers; the elements themselves are no longer `volatile`.
+- **Zero-copy areas** hand out `T*` / `const T*` instead of `volatile T*` (still converts implicitly where a `volatile T*` is expected).
+- **`clear()`** — one 32-bit store; no `cpsid` in `None`/`SPSC`; documented call contract (see API reference).
+- **No CMSIS prerequisite** — `PrimaskLock` is self-contained.
+- **Faster `pop`/`peek`/`isEmpty`** — empty test on the raw state word; removes the stack frame of `pop` on Cortex-M33.
+- **Faster `push_n`/`pop_n`** — element loops instead of two `memcpy` calls; lock guards no longer cause calls in `-O0` builds.
+- **Deprecated:** declaring a buffer without a topology. Still `None`, but now a compiler warning; mandatory in 2.0. *Compatibility note:* the omitted-topology type is now distinct from an explicit `Topology::None<>` (needed to detect it), so code that passes such a buffer to a function declared for `RingBuffer_PackedState<T, N, Topology::None<>>&` no longer compiles — add the topology to the declaration. Projects building with `-Werror` see the warning as an error.
 
 ---
 
