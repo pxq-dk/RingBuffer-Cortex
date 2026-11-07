@@ -96,10 +96,43 @@ extern volatile uint32_t RingBuffer_PackedState_stress_seq_errors;
 #endif
 
 
+// Default LockImpl: masks all configurable interrupts via PRIMASK, nestable
+// (unlock restores the previous state instead of blindly re-enabling).
+//
+// Self-contained: no CMSIS declarations needed before this header. 1.3.2 called
+// __get_PRIMASK/__disable_irq/__set_PRIMASK; PrimaskLock is a non-template
+// class, so those non-dependent names were looked up when the header was
+// parsed — every user had to include CMSIS first, even for SPSC/None, which
+// never lock. The asm below is identical to CMSIS cmsis_gcc.h, "memory"
+// clobbers included: a lock must also be a compiler barrier, or GCC could
+// move accesses out of the critical section.
+//
+// Off Cortex-M (e.g. host unit tests) the functions are templates, so their
+// bodies are only checked when used: SPSC/None compile fine, and actually
+// locking with PrimaskLock gives a clear error instead of a missing name.
+#if (defined(__GNUC__) || defined(__clang__)) && defined(__ARM_ARCH_PROFILE) && (__ARM_ARCH_PROFILE == 'M')
 struct PrimaskLock {
-	static uint32_t lock()             { uint32_t p = __get_PRIMASK(); __disable_irq(); return p; }
-	static void     unlock(uint32_t p) { __set_PRIMASK(p); }
+	static inline __attribute__((always_inline)) uint32_t lock() {
+		uint32_t p;
+		__asm__ volatile("mrs %0, primask" : "=r"(p) :: "memory");
+		__asm__ volatile("cpsid i" ::: "memory");
+		return p;
+	}
+	static inline __attribute__((always_inline)) void unlock(uint32_t p) {
+		__asm__ volatile("msr primask, %0" :: "r"(p) : "memory");
+	}
 };
+#else
+struct PrimaskLock {
+	template<int N = 0> static uint32_t lock() {
+		static_assert(N != 0, "PrimaskLock needs a Cortex-M target (GCC/Clang); pass your own LockImpl, e.g. Topology::MPSC<MyLock>");
+		return 0;
+	}
+	template<int N = 0> static void unlock(uint32_t) {
+		static_assert(N != 0, "PrimaskLock needs a Cortex-M target (GCC/Clang); pass your own LockImpl, e.g. Topology::MPSC<MyLock>");
+	}
+};
+#endif
 
 struct Topology {
 	// Single context — no concurrency at all.
