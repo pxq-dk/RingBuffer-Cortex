@@ -19,7 +19,7 @@
 
 #pragma once
 
-inline constexpr const char* RINGBUFFER_PACKEDSTATE_VERSION = "1.4.0";
+inline constexpr const char* RINGBUFFER_PACKEDSTATE_VERSION = "1.4.1";
 
 // Master switch for the runtime test code (Layer 1 selftest + Layer 2 stress
 // test). Set to 0 to remove all test definitions, declarations, and the
@@ -89,8 +89,8 @@ extern volatile uint32_t RingBuffer_PackedState_stress_seq_errors;
 // an RB_OPT function must therefore be RB_OPT_INLINE (see ActiveGuard/NoGuard).
 //
 // RB_OPT_COPY: RB_OPT for push_n()/pop_n(), plus no-tree-loop-distribute-patterns
-// so GCC keeps the element loop instead of turning it back into memcpy calls
-// (newlib-nano memcpy is a byte loop too, plus call overhead - measured slower).
+// so GCC keeps the small-block element loop instead of turning it into a memcpy
+// call (see RB_COPY_LOOP_MAX).
 #if defined(__GNUC__) || defined(__clang__)
 	#define RB_OPT        [[gnu::optimize("Os")]]
 	#define RB_OPT_INLINE [[gnu::optimize("Os"), gnu::always_inline]]
@@ -100,6 +100,31 @@ extern volatile uint32_t RingBuffer_PackedState_stress_seq_errors;
 	#define RB_OPT_INLINE
 	#define RB_OPT_COPY
 #endif
+
+// Bulk copy in push_n()/pop_n() (1.4.1). User-configurable: define before the include.
+//
+// RB_COPY_LOOP_MAX - copy segments of up to this many BYTES use a plain element
+//   loop; larger segments use memcpy. Default 8.
+//   Small blocks (the common case in a ring buffer) are dominated by the memcpy
+//   call overhead, which costs the same with every C library: measured n=4,
+//   loop vs memcpy, 134 vs 168 cycles on Cortex-M0+ and 105 vs 131 on Cortex-M33.
+//   Large blocks are left to the C library: its memcpy decides the speed, so a
+//   faster C library speeds them up. Note that memcpy speed depends on how the C
+//   library was BUILT, not on the core or compiler version - e.g. STM32CubeIDE's
+//   GNU Tools for STM32 11.3 (newlib 4.2.0) link newlib's byte-loop memcpy for
+//   every Cortex-M, while the Debian/Ubuntu newlib 4.6.0 package copies words
+//   when source and destination are both 4-byte aligned.
+//   0 = always memcpy; a value >= the buffer size in bytes = never memcpy.
+//   Non-trivially-copyable element types always use the element loop.
+//   A macro so it can be set from the build system (-DRB_COPY_LOOP_MAX=16); the
+//   code only uses the typed constant below. Use the SAME value in every
+//   translation unit of a program (set it centrally), or different TUs get
+//   different definitions of the same inline functions (ODR violation).
+#ifndef RB_COPY_LOOP_MAX
+	#define RB_COPY_LOOP_MAX 8
+#endif
+static_assert((RB_COPY_LOOP_MAX) >= 0, "RB_COPY_LOOP_MAX must be a non-negative number of bytes");
+inline constexpr size_t RINGBUFFER_PACKEDSTATE_COPY_LOOP_MAX = static_cast<size_t>(RB_COPY_LOOP_MAX);
 
 // The builtin folds to a constant even at -O0. std::is_constant_evaluated() is
 // a libstdc++ wrapper that, in -O0 Debug builds, is emitted as a real
@@ -563,15 +588,26 @@ class RingBuffer_PackedState
 		return true;
 	}
 
+	// Copies n elements (non-overlapping): element loop for small segments,
+	// memcpy above RB_COPY_LOOP_MAX bytes (see there). Constant evaluation and
+	// non-trivially-copyable T always use the loop.
+	RB_OPT_INLINE static constexpr void copy_elems(T* d, const T* s, size_t n) {
+		if constexpr (std::is_trivially_copyable_v<T>) {
+			if (!RB_IS_CONSTANT_EVALUATED()) {
+				// n <= Size always holds (callers clamp); stating it lets GCC prove the
+				// length bound - otherwise -Wstringop-overflow fires on `count - first`.
+				if (n * sizeof(T) > RINGBUFFER_PACKEDSTATE_COPY_LOOP_MAX && n <= Size) {
+					memcpy(d, s, n * sizeof(T));
+					return;
+				}
+			}
+		}
+		for (size_t i = 0; i < n; ++i) d[i] = s[i];
+	}
+
 	// Pushes up to count elements from ptr. Returns the number actually pushed —
 	// may be less than count if space is limited. Handles wrap automatically.
-	// ProducerGuard protected.
-	// Plain element loops, not memcpy (measured on STM32G071, uint8_t, n=4:
-	// 184 -> 134 cycles together with the guard fix): no call overhead, no
-	// second call when nothing wraps (the 2nd loop simply runs 0 times), and
-	// elements of 4 bytes are copied as words anyway. A 32-bit word fast path
-	// for byte buffers was measured too and rejected: it only wins for large
-	// blocks with matching alignment, is much slower otherwise, +216 B flash.
+	// ProducerGuard protected. Copy: see copy_elems() / RB_COPY_LOOP_MAX.
 	RB_OPT_COPY constexpr size_t push_n(const T* ptr, size_t count) {
 		ProducerGuard g;
 		auto [h, t] = readHT();
@@ -580,8 +616,8 @@ class RingBuffer_PackedState
 		size_t first = Size - h;
 		if (first > count) first = count;
 		acquire_barrier();
-		for (size_t i = 0; i < first; ++i)         buffer[h + i] = ptr[i];
-		for (size_t i = 0; i < count - first; ++i) buffer[i]     = ptr[first + i];
+		copy_elems(&buffer[h], ptr,         first);
+		copy_elems(&buffer[0], ptr + first, count - first);
 		release_barrier();
 		uint32_t h32 = (uint32_t)h + count;
 		if constexpr (is_power_of_two)
@@ -594,7 +630,7 @@ class RingBuffer_PackedState
 
 	// Pops up to count elements into ptr. Returns the number actually popped —
 	// may be less than count if fewer elements are available. Handles wrap automatically.
-	// ConsumerGuard protected. Plain element loops, see push_n().
+	// ConsumerGuard protected. Copy strategy as in push_n().
 	RB_OPT_COPY constexpr size_t pop_n(T* ptr, size_t count) {
 		ConsumerGuard g;
 		auto [h, t] = readHT();
@@ -603,8 +639,8 @@ class RingBuffer_PackedState
 		size_t first = Size - t;
 		if (first > count) first = count;
 		acquire_barrier();
-		for (size_t i = 0; i < first; ++i)         ptr[i]         = buffer[t + i];
-		for (size_t i = 0; i < count - first; ++i) ptr[first + i] = buffer[i];
+		copy_elems(ptr,         &buffer[t], first);
+		copy_elems(ptr + first, &buffer[0], count - first);
 		release_barrier();
 		uint32_t t32 = (uint32_t)t + count;
 		if constexpr (is_power_of_two)

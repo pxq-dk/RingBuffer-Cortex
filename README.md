@@ -65,6 +65,14 @@ RingBuffer_PackedState<uint8_t, 32, Topology::MPMC<FreeRtosLock>> rb_rtos;
 - ARM Cortex-M target (GCC `arm-none-eabi`) or any C++20 compiler for host-side use
 - No CMSIS headers needed: the built-in `PrimaskLock` uses its own `mrs` / `cpsid i` / `msr` (identical to CMSIS). On non-Cortex-M hosts `None` and `SPSC` build as-is; locking topologies need a custom lock there. Custom protection schemes (RTOS, custom critical sections) can be used by supplying a custom lock — see [IRQ Protection Policies](#irq-protection-policies).
 
+### Configuration (optional, define before the include)
+
+| Macro | Default | Effect |
+|---|---|---|
+| `RB_COPY_LOOP_MAX` | `8` | `push_n`/`pop_n` copy segments of up to this many **bytes** with a plain element loop and larger ones with `memcpy`. `0` = always `memcpy`; a value ≥ the buffer size in bytes = never. Set it **centrally** (e.g. `-DRB_COPY_LOOP_MAX=16`) so every source file of the program uses the same value. |
+
+**Why the split:** small blocks — the common case in a ring buffer — are dominated by the `memcpy` call overhead, which is the same with every C library (measured, 4 bytes, loop vs `memcpy`: 134 vs 168 cycles on Cortex-M0+, 105 vs 131 on Cortex-M33). Large blocks are left to the C library, so a faster C library makes them faster. How fast `memcpy` is depends on how the C library was **built**, not on the core or the compiler version: e.g. STM32CubeIDE's GNU Tools for STM32 11.3 (newlib 4.2.0) link a byte-loop `memcpy` for every Cortex-M, while the Debian/Ubuntu newlib 4.6.0 package copies whole words when source and destination are both 4-byte aligned. If large-block speed matters, use a C library with a word-based `memcpy`.
+
 ---
 
 ## Usage
@@ -151,8 +159,8 @@ auto out = rb.reserve_pop(32);    // tail advances immediately
 | `getCount()` | Returns number of elements currently in buffer. |
 | `getSpace()` | Returns number of free slots remaining. Producer counterpart to `getCount()`. |
 | `skip(count)` | Discards up to `count` elements by advancing tail without reading. Clamped to available data. Alias for `commit_pop()` — use when intent is discard rather than DMA consume. |
-| `push_n(ptr, count)` | Pushes up to `count` elements from `ptr`. Returns number actually pushed. Handles wrap automatically. Plain element loop (faster than newlib-nano `memcpy` for typical small blocks). ProducerGuard protected. |
-| `pop_n(ptr, count)` | Pops up to `count` elements into `ptr`. Returns number actually popped. Handles wrap automatically. Plain element loop. ConsumerGuard protected. |
+| `push_n(ptr, count)` | Pushes up to `count` elements from `ptr`. Returns number actually pushed. Handles wrap automatically. Copies without a library call: element loop on Cortex-M0/M0+, 4 bytes per step where unaligned access is available (see [Configuration](#configuration-optional-define-before-the-include)). ProducerGuard protected. |
+| `pop_n(ptr, count)` | Pops up to `count` elements into `ptr`. Returns number actually popped. Handles wrap automatically. Same copy strategy as `push_n`. ConsumerGuard protected. |
 | `clear()` | Resets buffer to empty with a single 32-bit store (no half-cleared state is ever visible). Locks only in topologies that already lock (MPSC/SPMC/MPMC). It overwrites the other side's index too: call it from the lowest-priority context that uses the buffer (typically main), or while the other side is idle — never from an ISR that can interrupt an unguarded push/pop. Do not call while a DMA transfer is active on this buffer — stop the DMA first. |
 
 ### DMA / contiguous area
@@ -258,6 +266,14 @@ Distinguishing full from empty without a separate count variable. If `head == ta
 **Why compile-time unit tests?**
 
 A `static_assert` in the constructor runs `unit_test_ringbuffer::run_test()` at compile time against a `Size=4` test instance. If any test fails, the translation unit will not compile — no separate test binary required.
+
+---
+
+## Changes in 1.4.1
+
+- **Fix — `push_n`/`pop_n` regression for larger blocks.** 1.4.0 replaced `memcpy` with a plain element loop everywhere. On Cortex-M33 with a word-based `memcpy` that loop lost from about 10 bytes on (64-byte blocks: ~2× slower than 1.3.2; ~6–7 cycles per byte from flash, 16–19 from SRAM). Now a hybrid: segments of up to `RB_COPY_LOOP_MAX` bytes (default 8) keep the element loop — no call overhead, the common small-block case stays fast — and larger segments use `memcpy` again, so their speed is the C library's.
+- **Correction of the 1.4.0 rationale.** 1.4.0 dropped `memcpy` because "newlib-nano `memcpy` is a byte loop too". That holds for the toolchain it was measured with (STM32CubeIDE's GNU Tools for STM32 11.3, newlib 4.2.0: byte-loop `memcpy` for every Cortex-M), but not in general — it depends on how newlib was built; e.g. the Debian/Ubuntu newlib 4.6.0 package copies words when both pointers are 4-byte aligned.
+- New optional configuration: `RB_COPY_LOOP_MAX` (see [Configuration](#configuration-optional-define-before-the-include)).
 
 ---
 
