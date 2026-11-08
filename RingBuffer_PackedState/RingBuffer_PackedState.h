@@ -112,8 +112,10 @@ extern volatile uint32_t RingBuffer_PackedState_stress_seq_errors;
 //   faster C library speeds them up. Note that memcpy speed depends on how the C
 //   library was BUILT, not on the core or compiler version - e.g. STM32CubeIDE's
 //   GNU Tools for STM32 11.3 (newlib 4.2.0) link newlib's byte-loop memcpy for
-//   every Cortex-M, while the Debian/Ubuntu newlib 4.6.0 package copies words
-//   when source and destination are both 4-byte aligned.
+//   every Cortex-M, while the Cortex-M33 memcpy of the Debian/Ubuntu newlib 4.6.0
+//   package copies words from 8 bytes on (one side aligned, unaligned access on
+//   the other; if neither is aligned it first copies 1-3 bytes to align the
+//   destination) and uses a byte loop below 8 bytes - which the default matches.
 //   0 = always memcpy; a value >= the buffer size in bytes = never memcpy.
 //   Non-trivially-copyable element types always use the element loop.
 //   A macro so it can be set from the build system (-DRB_COPY_LOOP_MAX=16); the
