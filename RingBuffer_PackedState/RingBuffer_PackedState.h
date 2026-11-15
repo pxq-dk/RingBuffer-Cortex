@@ -574,12 +574,21 @@ class RingBuffer_PackedState
 	static constexpr size_t copy_loop_max = RingBuffer_PackedState_copy_loop_max(sizeof(T));
 	RB_OPT_INLINE static constexpr bool copy_with_memcpy(size_t count) {
 		if constexpr (std::is_trivially_copyable_v<T> && copy_loop_max != RINGBUFFER_PACKEDSTATE_COPY_NEVER_MEMCPY) {
-			if (!RB_IS_CONSTANT_EVALUATED()) return count > copy_loop_max;
+			// copy_loop_max == 0 (large elements, or RB_COPY_LOOP_MAX = 0): always
+			// memcpy, also for count == 0 (copy_memcpy skips n == 0). The loop path is
+			// then dead code at run time; left reachable only for count == 0, GCC's
+			// loop analysis warns about it (-Waggressive-loop-optimizations).
+			if (!RB_IS_CONSTANT_EVALUATED()) return copy_loop_max == 0 || count > copy_loop_max;
 		}
 		return false;
 	}
 	RB_OPT_INLINE static constexpr void copy_loop(T* d, const T* s, size_t n) {
-		for (size_t i = 0; i < n; ++i) d[i] = s[i];
+		// Counts down in a bottom-tested loop: at -Os GCC turns the usual
+		// `for (i = 0; i < n; ++i)` into a loop with TWO taken branches per element
+		// (test at the top, jump back). This form has one - measured 8 instead of
+		// 10 cycles per byte on Cortex-M0+, 6 instead of 7 on Cortex-M33. The
+		// order within a block does not matter: it is published afterwards.
+		if (n != 0) { do { --n; d[n] = s[n]; } while (n != 0); }
 	}
 	// Only called when copy_with_memcpy() is true. n may be 0 (no wrapped part).
 	RB_OPT_INLINE static void copy_memcpy(T* d, const T* s, size_t n) {
@@ -758,7 +767,7 @@ class RingBuffer_PackedState
 	// Discards up to count elements without reading. Consumer operation.
 	// Equivalent to commit_pop() — provided for clarity at call sites where
 	// data is intentionally discarded rather than consumed after a DMA read.
-	void skip(size_t count) { commit_pop(count); }
+	RB_OPT_INLINE constexpr void skip(size_t count) { commit_pop(count); }
 
 	struct ContiguousArea {
 		element_type* ptr;
@@ -773,7 +782,7 @@ class RingBuffer_PackedState
 	// Returns pointer to head and how many elements can be written contiguously
 	// before the buffer wraps. Call commit_push() after writing.
 	// NOTE: reads state without a Guard — only one producer may call this at a time.
-	RB_OPT constexpr ContiguousArea get_contiguous_push_area(size_t max_size) {
+	RB_OPT_INLINE constexpr ContiguousArea get_contiguous_push_area(size_t max_size) {
 		auto [h, t] = readHT();
 		size_t   available = wrapSize((uint32_t)t + Size - (uint32_t)h - 1);
 		size_t   contiguous = Size - h;
@@ -784,7 +793,7 @@ class RingBuffer_PackedState
 	}
 
 	// Advances head by count after a contiguous push
-	RB_OPT constexpr void commit_push(size_t count) {
+	RB_OPT_INLINE constexpr void commit_push(size_t count) {
 		ProducerGuard g;
 		auto [h, t] = readHT();
 		size_t   available = wrapSize((uint32_t)t + Size - (uint32_t)h - 1);
@@ -801,7 +810,7 @@ class RingBuffer_PackedState
 	// Returns pointer to tail and how many elements can be read contiguously
 	// before the buffer wraps. Call commit_pop() after consuming.
 	// NOTE: reads state without a Guard — only one consumer may call this at a time.
-	RB_OPT constexpr ConstContiguousArea get_contiguous_pop_area(size_t max_size) const {
+	RB_OPT_INLINE constexpr ConstContiguousArea get_contiguous_pop_area(size_t max_size) const {
 		auto [h, t] = readHT();
 		size_t   available = wrapSize((uint32_t)h - (uint32_t)t + Size);
 		size_t   contiguous = Size - t;
@@ -812,7 +821,7 @@ class RingBuffer_PackedState
 	}
 
 	// Advances tail by count after a contiguous pop
-	RB_OPT constexpr void commit_pop(size_t count) {
+	RB_OPT_INLINE constexpr void commit_pop(size_t count) {
 		ConsumerGuard g;
 		auto [h, t] = readHT();
 		size_t   available = wrapSize((uint32_t)h - (uint32_t)t + Size);
