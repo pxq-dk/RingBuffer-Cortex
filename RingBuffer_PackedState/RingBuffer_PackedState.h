@@ -90,7 +90,7 @@ extern volatile uint32_t RingBuffer_PackedState_stress_seq_errors;
 //
 // RB_OPT_COPY: RB_OPT for push_n()/pop_n(), plus no-tree-loop-distribute-patterns
 // so GCC keeps the small-block element loop instead of turning it into a memcpy
-// call (see RB_COPY_LOOP_MAX).
+// call (see "Bulk copy" below).
 #if defined(__GNUC__) || defined(__clang__)
 	#define RB_OPT        [[gnu::optimize("Os")]]
 	#define RB_OPT_INLINE [[gnu::optimize("Os"), gnu::always_inline]]
@@ -101,32 +101,68 @@ extern volatile uint32_t RingBuffer_PackedState_stress_seq_errors;
 	#define RB_OPT_COPY
 #endif
 
-// Bulk copy in push_n()/pop_n() (1.4.1). User-configurable: define before the include.
+// Bulk copy in push_n()/pop_n() (1.4.1): a plain element loop for short blocks,
+// the C library's memcpy for longer ones. Where the switch pays off depends on
+// the core, on the C library and on the element size, so the limit is chosen
+// automatically:
 //
-// RB_COPY_LOOP_MAX - copy segments of up to this many BYTES use a plain element
-//   loop; larger segments use memcpy. Default 8.
-//   Small blocks (the common case in a ring buffer) are dominated by the memcpy
-//   call overhead, which costs the same with every C library: measured n=4,
-//   loop vs memcpy, 134 vs 168 cycles on Cortex-M0+ and 105 vs 131 on Cortex-M33.
-//   Large blocks are left to the C library: its memcpy decides the speed, so a
-//   faster C library speeds them up. Note that memcpy speed depends on how the C
-//   library was BUILT, not on the core or compiler version - e.g. STM32CubeIDE's
-//   GNU Tools for STM32 11.3 (newlib 4.2.0) link newlib's byte-loop memcpy for
-//   every Cortex-M, while the Cortex-M33 memcpy of the Debian/Ubuntu newlib 4.6.0
-//   package copies words from 8 bytes on (one side aligned, unaligned access on
-//   the other; if neither is aligned it first copies 1-3 bytes to align the
-//   destination) and uses a byte loop below 8 bytes - which the default matches.
-//   0 = always memcpy; a value >= the buffer size in bytes = never memcpy.
-//   Non-trivially-copyable element types always use the element loop.
-//   A macro so it can be set from the build system (-DRB_COPY_LOOP_MAX=16); the
-//   code only uses the typed constant below. Use the SAME value in every
-//   translation unit of a program (set it centrally), or different TUs get
-//   different definitions of the same inline functions (ODR violation).
-#ifndef RB_COPY_LOOP_MAX
-	#define RB_COPY_LOOP_MAX 8
+//   C library / core                         element loop up to      then
+//   newlib-nano (any core)                   always                  -
+//   ARMv6-M (M0/M0+), any C library          always                  -
+//   everything else (Thumb-2 cores, hosts)   8 elements, max 48 B    memcpy
+//
+// Measured from flash with GCC 14.3, cycles for push_n, mean over all head
+// positions (nRF5340 Cortex-M33 64 MHz cache on; STM32G0B1 Cortex-M0+ 64 MHz):
+// - newlib-nano's memcpy is a byte loop with call overhead: it never beats the
+//   element loop (M33, 64 elements: uint8_t 381 vs 366, uint32_t 1346 vs 431).
+//   There the code is exactly the plain loops of 1.4.0, memcpy is not referenced.
+// - Thumb-2 with an optimised memcpy (full newlib): break-even at about 8
+//   elements for uint8_t, uint16_t and uint32_t alike; at 64 elements the
+//   hybrid is 2.9x / 2.6x / 2.0x faster than the loop (126 / 165 / 221 vs
+//   366 / 431 / 431). A 12-byte struct breaks even at about 48 bytes.
+//   Price: having both paths costs blocks of up to 8 elements 6-17 cycles
+//   against the pure loop (one uint8_t: 57 vs 51; one uint32_t: 70 vs 53).
+// - ARMv6-M has no unaligned access; full newlib's memcpy copies words only when
+//   source AND destination are 4-byte aligned, and bytes otherwise. With the
+//   head moving through the buffer it does not pay off for uint8_t / uint16_t
+//   (64 elements: 586 vs 634 / 823 vs 712) or a 12-byte struct. For uint32_t it
+//   wins only from about 24 elements on (64 elements: 570 vs 712) and costs
+//   every shorter block up to 13 cycles - so ARMv6-M always uses the loop. Set
+//   RB_COPY_LOOP_MAX (e.g. 16) if you move long blocks of 4-byte elements.
+// newlib-nano is recognised by _NANO_FORMATTED_IO from its <newlib.h>, which
+// needs --specs=nano.specs on the COMPILER command line too (STM32CubeIDE does
+// that). If it is passed to the linker only, set RB_COPY_LOOP_MAX yourself.
+// Non-trivially-copyable element types always use the element loop.
+//
+// RB_COPY_LOOP_MAX - optional override, define before the include: blocks of up
+//   to this many ELEMENTS use the element loop, longer ones memcpy - for every
+//   element type. 0 = always memcpy; a value >= the buffer size = never memcpy.
+//   A macro so it can be set from the build system (-DRB_COPY_LOOP_MAX=16). Use
+//   the SAME value (or none) in every translation unit of a program, or
+//   different TUs get different definitions of the same inline functions (ODR
+//   violation).
+inline constexpr size_t RINGBUFFER_PACKEDSTATE_COPY_NEVER_MEMCPY = static_cast<size_t>(-1);
+#ifdef RB_COPY_LOOP_MAX
+static_assert((RB_COPY_LOOP_MAX) >= 0, "RB_COPY_LOOP_MAX must be a non-negative number of elements");
 #endif
-static_assert((RB_COPY_LOOP_MAX) >= 0, "RB_COPY_LOOP_MAX must be a non-negative number of bytes");
-inline constexpr size_t RINGBUFFER_PACKEDSTATE_COPY_LOOP_MAX = static_cast<size_t>(RB_COPY_LOOP_MAX);
+// Largest block (in elements) copied with the element loop, for an element of
+// the given size.
+constexpr size_t RingBuffer_PackedState_copy_loop_max([[maybe_unused]] size_t elem_size) {
+#if defined(RB_COPY_LOOP_MAX)
+	return static_cast<size_t>(RB_COPY_LOOP_MAX);
+#elif defined(_NANO_FORMATTED_IO) || (defined(__ARM_ARCH_ISA_THUMB) && (__ARM_ARCH_ISA_THUMB == 1))
+	return RINGBUFFER_PACKEDSTATE_COPY_NEVER_MEMCPY;
+#else
+	return (elem_size * 8 > 48) ? 48 / elem_size : 8;
+#endif
+}
+
+// States a fact the compiler cannot derive; emits no code.
+#if defined(__GNUC__) || defined(__clang__)
+	#define RB_ASSUME(cond) do { if (!(cond)) __builtin_unreachable(); } while (0)
+#else
+	#define RB_ASSUME(cond) do { } while (0)
+#endif
 
 // The builtin folds to a constant even at -O0. std::is_constant_evaluated() is
 // a libstdc++ wrapper that, in -O0 Debug builds, is emitted as a real
@@ -528,6 +564,31 @@ class RingBuffer_PackedState
 		else                           return (val >= Size) ? val - Size : val;
 	}
 
+	// Bulk copy for push_n()/pop_n(): element loops for blocks of up to
+	// copy_loop_max elements, memcpy above (see RB_COPY_LOOP_MAX for how the limit
+	// is chosen). The block is tested ONCE as a whole (copy_with_memcpy), not once
+	// per segment, and the two segments are then copied one after the other - so
+	// the short-block path is the two plain loops of 1.4.0 plus a single compare.
+	// Constant evaluation and non-trivially-copyable T always use the loops; where
+	// memcpy is never used the test folds to false and memcpy is not referenced.
+	static constexpr size_t copy_loop_max = RingBuffer_PackedState_copy_loop_max(sizeof(T));
+	RB_OPT_INLINE static constexpr bool copy_with_memcpy(size_t count) {
+		if constexpr (std::is_trivially_copyable_v<T> && copy_loop_max != RINGBUFFER_PACKEDSTATE_COPY_NEVER_MEMCPY) {
+			if (!RB_IS_CONSTANT_EVALUATED()) return count > copy_loop_max;
+		}
+		return false;
+	}
+	RB_OPT_INLINE static constexpr void copy_loop(T* d, const T* s, size_t n) {
+		for (size_t i = 0; i < n; ++i) d[i] = s[i];
+	}
+	// Only called when copy_with_memcpy() is true. n may be 0 (no wrapped part).
+	RB_OPT_INLINE static void copy_memcpy(T* d, const T* s, size_t n) {
+		// Callers clamp n to the buffer size; stating it lets GCC prove the length
+		// bound - otherwise -Wstringop-overflow fires on `count - first`.
+		RB_ASSUME(n <= Size);
+		if (n != 0) memcpy(d, s, n * sizeof(T));
+	}
+
 	public:
 	using value_type = T;
 	static constexpr size_t capacity = Size - 1;
@@ -590,26 +651,9 @@ class RingBuffer_PackedState
 		return true;
 	}
 
-	// Copies n elements (non-overlapping): element loop for small segments,
-	// memcpy above RB_COPY_LOOP_MAX bytes (see there). Constant evaluation and
-	// non-trivially-copyable T always use the loop.
-	RB_OPT_INLINE static constexpr void copy_elems(T* d, const T* s, size_t n) {
-		if constexpr (std::is_trivially_copyable_v<T>) {
-			if (!RB_IS_CONSTANT_EVALUATED()) {
-				// n <= Size always holds (callers clamp); stating it lets GCC prove the
-				// length bound - otherwise -Wstringop-overflow fires on `count - first`.
-				if (n * sizeof(T) > RINGBUFFER_PACKEDSTATE_COPY_LOOP_MAX && n <= Size) {
-					memcpy(d, s, n * sizeof(T));
-					return;
-				}
-			}
-		}
-		for (size_t i = 0; i < n; ++i) d[i] = s[i];
-	}
-
 	// Pushes up to count elements from ptr. Returns the number actually pushed —
 	// may be less than count if space is limited. Handles wrap automatically.
-	// ProducerGuard protected. Copy: see copy_elems() / RB_COPY_LOOP_MAX.
+	// ProducerGuard protected. Copy: see copy_with_memcpy() / RB_COPY_LOOP_MAX.
 	RB_OPT_COPY constexpr size_t push_n(const T* ptr, size_t count) {
 		ProducerGuard g;
 		auto [h, t] = readHT();
@@ -618,8 +662,13 @@ class RingBuffer_PackedState
 		size_t first = Size - h;
 		if (first > count) first = count;
 		acquire_barrier();
-		copy_elems(&buffer[h], ptr,         first);
-		copy_elems(&buffer[0], ptr + first, count - first);
+		if (copy_with_memcpy(count)) {
+			copy_memcpy(&buffer[h], ptr,         first);
+			copy_memcpy(&buffer[0], ptr + first, count - first);
+		} else {
+			copy_loop(&buffer[h], ptr,         first);
+			copy_loop(&buffer[0], ptr + first, count - first);
+		}
 		release_barrier();
 		uint32_t h32 = (uint32_t)h + count;
 		if constexpr (is_power_of_two)
@@ -641,8 +690,13 @@ class RingBuffer_PackedState
 		size_t first = Size - t;
 		if (first > count) first = count;
 		acquire_barrier();
-		copy_elems(ptr,         &buffer[t], first);
-		copy_elems(ptr + first, &buffer[0], count - first);
+		if (copy_with_memcpy(count)) {
+			copy_memcpy(ptr,         &buffer[t], first);
+			copy_memcpy(ptr + first, &buffer[0], count - first);
+		} else {
+			copy_loop(ptr,         &buffer[t], first);
+			copy_loop(ptr + first, &buffer[0], count - first);
+		}
 		release_barrier();
 		uint32_t t32 = (uint32_t)t + count;
 		if constexpr (is_power_of_two)
@@ -804,3 +858,4 @@ class RingBuffer_PackedState
 #undef RB_OPT_INLINE
 #undef RB_OPT_COPY
 #undef RB_IS_CONSTANT_EVALUATED
+#undef RB_ASSUME

@@ -69,9 +69,32 @@ RingBuffer_PackedState<uint8_t, 32, Topology::MPMC<FreeRtosLock>> rb_rtos;
 
 | Macro | Default | Effect |
 |---|---|---|
-| `RB_COPY_LOOP_MAX` | `8` | `push_n`/`pop_n` copy segments of up to this many **bytes** with a plain element loop and larger ones with `memcpy`. `0` = always `memcpy`; a value ≥ the buffer size in bytes = never. Set it **centrally** (e.g. `-DRB_COPY_LOOP_MAX=16`) so every source file of the program uses the same value. |
+| `RB_COPY_LOOP_MAX` | automatic (see below) | Override for `push_n`/`pop_n`: blocks of up to this many **elements** are copied with a plain element loop, longer ones with `memcpy` — for every element type. `0` = always `memcpy`; a value ≥ the buffer size = never. Set it **centrally** (e.g. `-DRB_COPY_LOOP_MAX=16`) so every source file of the program uses the same value. |
 
-**Why the split:** small blocks — the common case in a ring buffer — are dominated by the `memcpy` call overhead, which is the same with every C library (measured, 4 bytes, loop vs `memcpy`: 134 vs 168 cycles on Cortex-M0+, 105 vs 131 on Cortex-M33). Large blocks are left to the C library, so a faster C library makes them faster. How fast `memcpy` is depends on how the C library was **built**, not on the core or the compiler version: e.g. STM32CubeIDE's GNU Tools for STM32 11.3 (newlib 4.2.0) link a byte-loop `memcpy` for every Cortex-M, while the Cortex-M33 `memcpy` of the Debian/Ubuntu newlib 4.6.0 package copies whole words from 8 bytes on (one side aligned, unaligned access on the other; if neither is aligned it first aligns the destination with 1–3 bytes) and uses a byte loop below 8 bytes — which the default of 8 matches. If large-block speed matters, use a C library with a word-based `memcpy`.
+#### How `push_n` / `pop_n` copy
+
+Short blocks use a plain element loop (no call overhead), longer ones the C library's `memcpy`. Where the switch pays off depends on the core, the C library and the element size, so the limit is chosen automatically:
+
+| C library / core | Element loop up to | Then |
+|---|---|---|
+| newlib-nano (any core) | always | — |
+| Cortex-M0/M0+ (any C library) | always | — |
+| everything else (Cortex-M3/M4/M7/M33, hosts) | 8 elements, at most 48 bytes | `memcpy` |
+
+Measured from flash with GCC 14.3 — cycles for `push_n` including the call, mean over all head positions, element loop vs `memcpy`:
+
+| 64 elements | nRF5340 (Cortex-M33, 64 MHz, cache on), full newlib | STM32G0B1 (Cortex-M0+, 64 MHz), full newlib | nRF5340, newlib-nano |
+|---|---|---|---|
+| `uint8_t` | 366 vs **126** | 634 vs 586 | **366** vs 381 |
+| `uint16_t` | 431 vs **165** | **712** vs 823 | **431** vs 705 |
+| `uint32_t` | 431 vs **221** | 712 vs **570** | **431** vs 1346 |
+
+- **newlib-nano's `memcpy` is a byte loop** behind a call — it never beats the element loop, so it is never used: the code is then exactly the plain loops of 1.4.0 and `memcpy` is not referenced. newlib-nano is the default C library of STM32CubeIDE projects ("Reduced C").
+- **Thumb-2 cores with an optimised `memcpy`** (full newlib of GNU Tools for STM32 14.3; in 11.3 the full newlib has the byte loop too): break-even at about 8 elements for 1-, 2- and 4-byte elements alike; a 12-byte struct breaks even at about 48 bytes. The price of having both paths: blocks of up to 8 elements cost 6–17 cycles more than with the pure loop (one `uint8_t`: 57 vs 51 cycles; one `uint32_t`: 70 vs 53). If you only ever move short blocks, set `RB_COPY_LOOP_MAX` to a large value.
+- **Cortex-M0/M0+ has no unaligned access**: full newlib's `memcpy` copies words only when source *and* destination are 4-byte aligned, and bytes otherwise. With the head moving through the buffer that does not pay off for 1- and 2-byte elements; for `uint32_t` it wins only from about 24 elements on and costs every shorter block up to 13 cycles. Cortex-M0/M0+ therefore always uses the element loop — set `RB_COPY_LOOP_MAX` (e.g. `16`) if you move long blocks of 4-byte elements with a full newlib.
+- Not measured: other Thumb-2 cores than the M33 (assumed to behave alike) and 8-byte elements.
+
+newlib-nano is recognised at compile time (`_NANO_FORMATTED_IO` from its `<newlib.h>`), which needs `--specs=nano.specs` on the **compiler** command line too — STM32CubeIDE does that. If your build passes it to the linker only, set `RB_COPY_LOOP_MAX` to a large value yourself. For large transfers prefer the zero-copy [contiguous area API](#dma--contiguous-area-api): it does not copy at all.
 
 ---
 
@@ -159,7 +182,7 @@ auto out = rb.reserve_pop(32);    // tail advances immediately
 | `getCount()` | Returns number of elements currently in buffer. |
 | `getSpace()` | Returns number of free slots remaining. Producer counterpart to `getCount()`. |
 | `skip(count)` | Discards up to `count` elements by advancing tail without reading. Clamped to available data. Alias for `commit_pop()` — use when intent is discard rather than DMA consume. |
-| `push_n(ptr, count)` | Pushes up to `count` elements from `ptr`. Returns number actually pushed. Handles wrap automatically. Copies without a library call: element loop on Cortex-M0/M0+, 4 bytes per step where unaligned access is available (see [Configuration](#configuration-optional-define-before-the-include)). ProducerGuard protected. |
+| `push_n(ptr, count)` | Pushes up to `count` elements from `ptr`. Returns number actually pushed. Handles wrap automatically. Short blocks are copied with an element loop, longer ones with `memcpy` where that is faster (see [How `push_n` / `pop_n` copy](#how-push_n--pop_n-copy)). ProducerGuard protected. |
 | `pop_n(ptr, count)` | Pops up to `count` elements into `ptr`. Returns number actually popped. Handles wrap automatically. Same copy strategy as `push_n`. ConsumerGuard protected. |
 | `clear()` | Resets buffer to empty with a single 32-bit store (no half-cleared state is ever visible). Locks only in topologies that already lock (MPSC/SPMC/MPMC). It overwrites the other side's index too: call it from the lowest-priority context that uses the buffer (typically main), or while the other side is idle — never from an ISR that can interrupt an unguarded push/pop. Do not call while a DMA transfer is active on this buffer — stop the DMA first. |
 
@@ -271,8 +294,8 @@ A `static_assert` in the constructor runs `unit_test_ringbuffer::run_test()` at 
 
 ## Changes in 1.4.1
 
-- **Fix — `push_n`/`pop_n` regression for larger blocks.** 1.4.0 replaced `memcpy` with a plain element loop everywhere. On Cortex-M33 with a word-based `memcpy` that loop lost from about 10 bytes on (64-byte blocks: ~2× slower than 1.3.2; ~6–7 cycles per byte from flash, 16–19 from SRAM). Now a hybrid: segments of up to `RB_COPY_LOOP_MAX` bytes (default 8) keep the element loop — no call overhead, the common small-block case stays fast — and larger segments use `memcpy` again, so their speed is the C library's.
-- **Correction of the 1.4.0 rationale.** 1.4.0 dropped `memcpy` because "newlib-nano `memcpy` is a byte loop too". That holds for the toolchain it was measured with (STM32CubeIDE's GNU Tools for STM32 11.3, newlib 4.2.0: byte-loop `memcpy` for every Cortex-M), but not in general — it depends on how newlib was built; e.g. the Cortex-M33 `memcpy` of the Debian/Ubuntu newlib 4.6.0 package copies words from 8 bytes on.
+- **Fix — `push_n`/`pop_n` regression for larger blocks.** 1.4.0 replaced `memcpy` with a plain element loop everywhere. On a Cortex-M33 with an optimised `memcpy` that loop loses from about 8 elements on (64 bytes: 366 vs 126 cycles). Now a hybrid: short blocks keep the element loop — no call overhead, the common small-block case stays fast — and longer blocks use `memcpy` where it was measured to be faster. The limit is chosen automatically from the core, the C library and the element size (see [How `push_n` / `pop_n` copy](#how-push_n--pop_n-copy)); with newlib-nano, and on Cortex-M0/M0+, the behaviour of 1.4.0 is unchanged.
+- **Correction of the 1.4.0 rationale.** 1.4.0 dropped `memcpy` because "newlib-nano `memcpy` is a byte loop too". True for newlib-nano, and for the full newlib of GNU Tools for STM32 11.3 as well — but the full newlib of 14.3 and other C libraries ship an optimised `memcpy`.
 - New optional configuration: `RB_COPY_LOOP_MAX` (see [Configuration](#configuration-optional-define-before-the-include)).
 
 ---
