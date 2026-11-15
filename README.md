@@ -156,6 +156,44 @@ auto out = rb.reserve_pop(32);    // tail advances immediately
 // No commit needed — index already advanced
 ```
 
+> **Caution:** `reserve_push` publishes the head *before* the data is written, and `reserve_pop` releases the slots *before* they are read. If the other side runs in the meantime (an ISR, or the DMA-complete path of another channel), it reads unwritten slots or overwrites slots still being read. Use them only while the other side cannot run. For several producers that fill outside the lock, use [producer reservations](#producer-reservations-mpsc--mpmc) instead.
+
+### Producer reservations (MPSC / MPMC)
+
+Several producers — main, ISRs, DMA-complete handlers — can each **reserve** a block, fill it **outside** the lock (slow copy, DMA), and **commit** it in any order. The consumer only ever sees data up to the oldest unfinished reservation, so nothing is visible before it is complete, and nobody ever waits:
+
+```cpp
+// Up to 4 reservations open at the same time (N = 1, 2, 4 or 8).
+RingBuffer_PackedState<uint8_t, 128, Topology::MPSC<PrimaskLock, 4>> rb;
+
+// Producer, any context:
+auto r = rb.reserve(16);          // up to 16 contiguous slots; r.count == 0: refused
+if (r.count) {
+    fill(r.ptr, r.count);         // outside any lock - may be interrupted by other producers
+    rb.commit(r);                 // visible once all OLDER reservations are committed too
+}
+
+// Used less than reserved (e.g. a formatted message shorter than its maximum)?
+auto m = rb.reserve(32);
+if (m.count) {
+    size_t used = format_message(m.ptr, m.count);
+    pad(m.ptr + used, m.count - used);          // something the consumer can skip
+    rb.commit(m, used);           // publishes `used` if nothing is behind m, else all m.count
+}
+
+// push() / push_n() keep working; behind an open reservation they queue up after it.
+```
+
+- **Reservations off (`MPSC<>`, the default) costs nothing**: the table, the extra check and the functions are compiled out — same machine code as without the feature (checked on Cortex-M0+ and Cortex-M33 at `-O0`, `-Os`, `-O2`).
+- With reservations on (measured from flash at `-Os` on STM32G0B1, Cortex-M0+ 64 MHz, and nRF5340, Cortex-M33 64 MHz): +2·N+6 bytes RAM per buffer plus alignment padding (N = 4: +16 B); `push()` fast path (no reservation open) ≈ +13 cycles on the Cortex-M0+, none measurable on the Cortex-M33; `reserve(4)` + filling 4 elements + `commit()` 211 / 115 cycles including the calls, `commit()` alone 58 / 30. Flash per buffer type, each function only if it is used (Cortex-M0+, `-Os`, `uint8_t`): `reserve()` 140 B, `commit(r)` 170 B, `commit(r, used)` 212 B, out-of-line slow paths of `push()` / `push_n()` 52 B / 108 B.
+- **`push()` / `push_n()` behind an open reservation** are appended to the youngest table entry and published with it. They take no table entry: they are refused only when the buffer is full.
+- **`reserve()` is refused (`count == 0`)** when the buffer is full or the table of N entries is full. An entry is taken by every open reservation — and by a finished one for as long as an *older* and a *younger* reservation are both still open (it is wedged between them). So N reservations can always be open at the same time as long as they finish youngest-first or oldest-first (nested ISRs do); finishing one in the middle first can cost an entry until a neighbour finishes.
+- **`commit(r, used)`** gives the unused tail back only while nothing has been reserved or pushed behind `r` — the slots behind it cannot move. Another producer may have come in between, so the caller cannot know: fill the tail with padding *before* the call and use the return value (`used` or `r.count`). That fits framed data (messages, records), not a raw byte stream. With a single producer it always shrinks; `used = 0` gives the reservation back completely when it can.
+- A reservation that is never committed holds back everything reserved after it — commit every non-empty reservation exactly once. Do not `clear()` while one is open. Neither is detected: a second `commit()` of the same reservation, or one after `clear()`, can publish another producer's unfinished block.
+- Tested with two producers under real preemption (main loop + jittered timer ISR, 400 000 interrupts, N = 4) on STM32G0B1 and nRF5340: no sequence errors, nothing published early, no refusals while the buffer had room.
+- `isFull()` / `getSpace()` count committed data only; producers should rely on the return values of `reserve()` / `push()` / `push_n()`.
+- With reservations enabled, `get_contiguous_push_area()` / `commit_push()` / `reserve_push()` are rejected at compile time (they would bypass the reservation table).
+
 ---
 
 ## Template Parameters
@@ -195,8 +233,16 @@ auto out = rb.reserve_pop(32);    // tail advances immediately
 | `commit_push(count)` | Advances head by `count` after a contiguous push. Clamped to available space. |
 | `get_contiguous_pop_area(max)` | Returns pointer + count of contiguous readable slots. Call `commit_pop()` after reading. |
 | `commit_pop(count)` | Advances tail by `count` after a contiguous pop. Clamped to available space. |
-| `reserve_push(max)` | Advances head immediately, returns pointer + count. Write after the call — no commit needed. |
-| `reserve_pop(max)` | Advances tail immediately, returns pointer + count. Read after the call — no commit needed. |
+| `reserve_push(max)` | Advances head immediately, returns pointer + count. Write after the call — no commit needed. **Only safe while the consumer cannot run** (see caution above). |
+| `reserve_pop(max)` | Advances tail immediately, returns pointer + count. Read after the call — no commit needed. **Only safe while the producer cannot run.** |
+
+### Producer reservations (`Topology::MPSC<Lock, N>` / `MPMC<Lock, N>`, N > 0)
+
+| Function | Description |
+|---|---|
+| `reserve(max)` | Reserves up to `max` contiguous slots (stops at the array end). Returns `{ptr, count}`; `count == 0` when the buffer or the reservation table is full. ProducerGuard protected; fill outside it. |
+| `commit(r)` | Marks reservation `r` complete. Publishes everything up to the oldest still-open reservation. Bounded work (≤ 2·N steps) under the ProducerGuard. Committing a refused reservation is a no-op. |
+| `commit(r, used)` | As `commit(r)`, but publishes only the first `used` elements if nothing has been reserved or pushed behind `r`; otherwise all `r.count`. Returns the number published. Pad the unused tail before the call. |
 
 > All functions use `readHT()` for their initial state read — a single 32-bit `LDR` atomic snapshot of head and tail, safe across ISR boundaries. Writes back to `state.head` or `state.tail` remain individual `STRH` instructions.
 
@@ -290,6 +336,14 @@ Distinguishing full from empty without a separate count variable. If `head == ta
 **Why compile-time unit tests?**
 
 A `static_assert` in the constructor runs `unit_test_ringbuffer::run_test()` at compile time against a `Size=4` test instance with `uint8_t` elements — it checks the index logic, which does not depend on the element type. If any test fails, the translation unit will not compile — no separate test binary required.
+
+---
+
+## Changes in 1.5.0
+
+- **New: producer reservations** for `MPSC` / `MPMC` — `reserve()` / `commit()`, opt-in via `Topology::MPSC<Lock, N>` (N = 1, 2, 4, 8). Out-of-order completion, in-order release, no waiting. `commit(r, used)` publishes less than was reserved when the block can still shrink. `push()` / `push_n()` behind an open reservation are limited by free space only. Off by default and then compiled out completely (same machine code at `-O0`, `-Os`, `-O2`).
+- `reserve_push()` / `reserve_pop()` documented as only safe while the other side cannot run; rejected at compile time when reservations are enabled.
+- Source-compatible with 1.4.1: `MPSC<>` / `MPSC<Lock>` / `MPMC<…>` keep working unchanged.
 
 ---
 

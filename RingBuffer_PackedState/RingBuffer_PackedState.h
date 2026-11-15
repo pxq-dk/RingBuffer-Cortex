@@ -19,7 +19,7 @@
 
 #pragma once
 
-inline constexpr const char* RINGBUFFER_PACKEDSTATE_VERSION = "1.4.1";
+inline constexpr const char* RINGBUFFER_PACKEDSTATE_VERSION = "1.5.0";
 
 // Master switch for the runtime test code (Layer 1 selftest + Layer 2 stress
 // test). Set to 0 to remove all test definitions, declarations, and the
@@ -95,10 +95,14 @@ extern volatile uint32_t RingBuffer_PackedState_stress_seq_errors;
 	#define RB_OPT        [[gnu::optimize("Os")]]
 	#define RB_OPT_INLINE [[gnu::optimize("Os"), gnu::always_inline]]
 	#define RB_OPT_COPY   [[gnu::optimize("Os", "no-tree-loop-distribute-patterns")]]
+	// Rarely taken paths (reservation slow paths): kept out of line so they do not
+	// bloat every inlined push() call site or raise its register pressure.
+	#define RB_OPT_COLD   [[gnu::optimize("Os", "no-tree-loop-distribute-patterns"), gnu::noinline, gnu::cold]]
 #else
 	#define RB_OPT
 	#define RB_OPT_INLINE
 	#define RB_OPT_COPY
+	#define RB_OPT_COLD
 #endif
 
 // Bulk copy in push_n()/pop_n() (1.4.1): a plain element loop for short blocks,
@@ -231,11 +235,16 @@ struct Topology {
 	};
 
 	// Multiple Producers, Single Consumer — producer side guarded, consumer side free.
-	template<typename LockImpl = PrimaskLock>
+	// MaxReservations (0, 1, 2, 4 or 8): size of the producer reservation table -
+	// how many reservations may be open at the same time (reserve() / commit(),
+	// see RingBuffer_PackedState for the exact rule). 0 = the feature is compiled
+	// out completely - no table, no extra compare, no code.
+	template<typename LockImpl = PrimaskLock, size_t MaxReservations = 0>
 	struct MPSC : LockImpl {
-		static constexpr bool needs_volatile = true;
-		static constexpr bool lock_p_needed  = true;
-		static constexpr bool lock_c_needed  = false;
+		static constexpr bool   needs_volatile   = true;
+		static constexpr bool   lock_p_needed    = true;
+		static constexpr bool   lock_c_needed    = false;
+		static constexpr size_t max_reservations = MaxReservations;
 	};
 
 	// Single Producer, Multiple Consumers — consumer side guarded, producer side free.
@@ -255,12 +264,31 @@ struct Topology {
 	struct Unspecified_ : None<LockImpl> {};
 
 	// Multiple Producers, Multiple Consumers — both sides guarded.
-	template<typename LockImpl = PrimaskLock>
+	// MaxReservations: as for MPSC (producer-side reservations).
+	template<typename LockImpl = PrimaskLock, size_t MaxReservations = 0>
 	struct MPMC : LockImpl {
-		static constexpr bool needs_volatile = true;
-		static constexpr bool lock_p_needed  = true;
-		static constexpr bool lock_c_needed  = true;
+		static constexpr bool   needs_volatile   = true;
+		static constexpr bool   lock_p_needed    = true;
+		static constexpr bool   lock_c_needed    = true;
+		static constexpr size_t max_reservations = MaxReservations;
 	};
+};
+
+// Lock for the compile-time unit tests of locking topologies: usable in
+// constant expressions, does nothing. Never use it in real code.
+struct RingBuffer_PackedState_ConstexprTestLock {
+	static constexpr uint32_t lock() { return 0; }
+	static constexpr void     unlock(uint32_t) {}
+};
+// Policy for the compile-time reservation tests: MPSC flags with a reservation
+// table, but needs_volatile = false - reading volatile objects is not allowed
+// in constant expressions. The tests are single-threaded, so volatile does not
+// matter for the logic under test. Never use it in real code.
+struct RingBuffer_PackedState_ConstexprReservationTestPolicy : RingBuffer_PackedState_ConstexprTestLock {
+	static constexpr bool   needs_volatile   = false;
+	static constexpr bool   lock_p_needed    = true;
+	static constexpr bool   lock_c_needed    = false;
+	static constexpr size_t max_reservations = 4;
 };
 
 template<typename RBType>
@@ -423,6 +451,113 @@ class unit_test_ringbuffer
 	}
 };
 
+// Compile-time tests of producer reservations (reserve()/commit()). RBType must
+// have max_reservations >= 2 and Size >= 8; run with a constexpr test lock.
+template<typename RBType>
+class unit_test_reservations
+{
+	public:
+	using value_type = typename RBType::value_type;
+	static constexpr size_t capacity = RBType::capacity;
+	static constexpr bool run_test()
+	{
+		value_type v{};
+		// Out-of-order finish: B done first stays hidden until the older A is done.
+		{ RBType rb;
+		  auto a = rb.reserve(2); auto b = rb.reserve(2);
+		  if (a.count != 2 || b.count != 2) return false;
+		  b.ptr[0] = static_cast<value_type>(3); b.ptr[1] = static_cast<value_type>(4); rb.commit(b);
+		  if (rb.getCount() != 0) return false;
+		  a.ptr[0] = static_cast<value_type>(1); a.ptr[1] = static_cast<value_type>(2); rb.commit(a);
+		  if (rb.getCount() != 4) return false;
+		  for (int i = 1; i <= 4; ++i) { if (!rb.pop(v) || v != static_cast<value_type>(i)) return false; } }
+
+		// Continuous overlap: the next reservation is always opened before the
+		// previous one commits - release must still progress (no starvation).
+		{ RBType rb; size_t got = 0;
+		  auto prev = rb.reserve(1); prev.ptr[0] = static_cast<value_type>(1);
+		  for (int round = 0; round < 3 * static_cast<int>(capacity); ++round) {
+			  auto next = rb.reserve(1); if (next.count != 1) return false;
+			  next.ptr[0] = static_cast<value_type>(1);
+			  rb.commit(prev);
+			  if (rb.getCount() == 0) return false;
+			  while (rb.pop(v)) ++got;
+			  prev = next; }
+		  rb.commit(prev); while (rb.pop(v)) ++got;
+		  if (got != 3 * capacity + 1) return false; }
+
+		// push() and push_n() behind an open reservation must not publish it.
+		{ RBType rb;
+		  auto a = rb.reserve(1);
+		  value_type two[2] = { static_cast<value_type>(8), static_cast<value_type>(9) };
+		  if (!rb.push(static_cast<value_type>(7)) || rb.push_n(two, 2) != 2) return false;
+		  if (rb.getCount() != 0) return false;
+		  a.ptr[0] = static_cast<value_type>(6); rb.commit(a);
+		  if (rb.getCount() != 4) return false;
+		  for (int i = 6; i <= 9; ++i) { if (!rb.pop(v) || v != static_cast<value_type>(i)) return false; } }
+
+		// Table full: one more reservation is refused, but push and push_n still work
+		// (they take no table entry) and stay hidden behind the open reservations.
+		{ RBType rb;
+		  typename RBType::Reservation r[RBType::max_reservations] {};
+		  for (size_t i = 0; i < RBType::max_reservations; ++i) { r[i] = rb.reserve(1); if (r[i].count != 1) return false; r[i].ptr[0] = static_cast<value_type>(i + 1); }
+		  value_type one[1] = { static_cast<value_type>(99) };
+		  if (rb.reserve(1).count != 0) return false;
+		  if (!rb.push(static_cast<value_type>(98)) || rb.push_n(one, 1) != 1) return false;
+		  if (rb.getCount() != 0) return false;
+		  for (size_t i = RBType::max_reservations; i-- > 0; ) rb.commit(r[i]);   // reverse order
+		  if (rb.getCount() != RBType::max_reservations + 2) return false;
+		  for (size_t i = 0; i < RBType::max_reservations; ++i) { if (!rb.pop(v) || v != static_cast<value_type>(i + 1)) return false; }
+		  if (!rb.pop(v) || v != static_cast<value_type>(98) || !rb.pop(v) || v != static_cast<value_type>(99)) return false; }
+
+		// reserve()+commit() behind an open reservation takes no table entry for
+		// good: far more of them than the table has entries, all stay hidden.
+		{ RBType rb; size_t got = 0;
+		  auto a = rb.reserve(1); a.ptr[0] = static_cast<value_type>(1);
+		  for (size_t i = 0; i < 2 * RBType::max_reservations + 1 && i + 2 < capacity; ++i) {
+			  auto b = rb.reserve(1); if (b.count != 1) return false;
+			  b.ptr[0] = static_cast<value_type>(i + 2); rb.commit(b); ++got;
+			  if (rb.getCount() != 0) return false; }
+		  rb.commit(a);
+		  if (rb.getCount() != got + 1) return false;
+		  for (size_t i = 0; i < got + 1; ++i) { if (!rb.pop(v) || v != static_cast<value_type>(i + 1)) return false; } }
+
+		// commit(r, used): shrinks while nothing is behind r, gives everything back
+		// with used = 0, and publishes the whole block once something is behind it.
+		{ RBType rb;
+		  auto a = rb.reserve(4); if (a.count != 4) return false;
+		  a.ptr[0] = static_cast<value_type>(1); a.ptr[1] = static_cast<value_type>(2);
+		  if (rb.commit(a, 2) != 2 || rb.getCount() != 2) return false;            // shrunk 4 -> 2
+		  auto b = rb.reserve(3); if (b.count != 3) return false;
+		  if (rb.commit(b, 0) != 0 || rb.getCount() != 2) return false;            // given back
+		  auto c = rb.reserve(2); auto d = rb.reserve(1);
+		  if (c.count != 2 || d.count != 1) return false;
+		  c.ptr[0] = static_cast<value_type>(3); c.ptr[1] = static_cast<value_type>(0);   // [1] = padding
+		  if (rb.commit(c, 1) != 2) return false;                                  // d is behind: cannot shrink
+		  if (rb.commit(d, 0) != 0) return false;                                  // youngest: given back
+		  if (!rb.push(static_cast<value_type>(4))) return false;
+		  if (rb.getCount() != 5) return false;
+		  const int expect[5] = { 1, 2, 3, 0, 4 };
+		  for (int i = 0; i < 5; ++i) { if (!rb.pop(v) || v != static_cast<value_type>(expect[i])) return false; }
+		  if (!rb.isEmpty()) return false; }
+
+		// Wrap: a reservation stops at the array end, the next one continues at 0.
+		{ RBType rb;
+		  for (size_t i = 0; i + 2 < capacity; ++i) { rb.push(static_cast<value_type>(0)); rb.pop(v); }  // index -> Size-3
+		  auto a = rb.reserve(8); auto b = rb.reserve(2);
+		  if (a.count != 3 || b.count != 2) return false;
+		  for (size_t i = 0; i < 3; ++i) a.ptr[i] = static_cast<value_type>(i + 1);
+		  b.ptr[0] = static_cast<value_type>(4); b.ptr[1] = static_cast<value_type>(5);
+		  rb.commit(b); rb.commit(a);
+		  for (int i = 1; i <= 5; ++i) { if (!rb.pop(v) || v != static_cast<value_type>(i)) return false; }
+		  if (!rb.isEmpty()) return false; }
+
+		// A refused (count == 0) reservation may be committed harmlessly.
+		{ RBType rb; typename RBType::Reservation none {}; rb.commit(none); if (!rb.isEmpty()) return false; }
+		return true;
+	}
+};
+
 // Emitted (as a deprecation warning, pointing at the user's line) when a
 // RingBuffer_PackedState is declared without a topology. A template so that
 // it is only checked when actually used: a non-template call would be looked
@@ -480,8 +615,51 @@ class RingBuffer_PackedState
 	// The order is enforced by acquire_barrier() / release_barrier() below.
 	using element_type = T;
 
+	// ---- producer reservations (opt-in: MPSC/MPMC<Lock, N>, N > 0) ----------
+	//
+	// Several producers may each hold an open reservation and fill it OUTSIDE the
+	// lock (copy, DMA). state.head then means "committed": everything up to the
+	// start of the OLDEST unfinished reservation. A reservation that finishes
+	// early is marked done and released together with the older one(s) when
+	// those finish - in order, without anybody ever waiting:
+	//
+	//    tail        state.head (committed)        res.reserved
+	//     |               |                             |
+	//  [ consumer data ][ open / done reservations ][ free ]
+	//
+	// res.reserved is only maintained while a reservation is open (res.count != 0);
+	// with none open the next free slot is state.head. The plain push()/push_n()
+	// fast path therefore is today's code plus one compare, and writes nothing to res.
+	// All res fields are producer-private and only touched under ProducerGuard.
+	template<typename P>
+	static constexpr size_t max_reservations_of() {
+		if constexpr (requires { P::max_reservations; }) return P::max_reservations;
+		else return 0;
+	}
+	public:
+	static constexpr size_t max_reservations = max_reservations_of<IrqPolicy>();
+	private:
+	static_assert(max_reservations <= 8 && (max_reservations & (max_reservations - 1)) == 0,
+	              "RingBuffer_PackedState: MaxReservations must be 0, 1, 2, 4 or 8");
+
+	template<size_t N, typename = void>
+	struct ResState {
+		uint16_t reserved = 0;       // next slot to hand out
+		uint8_t  first    = 0;       // table index of the oldest open reservation
+		uint8_t  count    = 0;       // open reservations
+		uint8_t  done     = 0;       // bit i: entry i finished, waiting for older ones
+		uint16_t end[N]   {};        // end index (exclusive) per open reservation
+	};
+	template<typename D>
+	struct ResState<0, D> {};        // feature off: empty, occupies no storage
+
 	// Adjacent halfwords — head written by producer (STRH), tail written by consumer (STRH).
 	alignas(4) struct { half_type head; half_type tail; } state;
+	// Right after state: small offsets, so the fast path reaches res.count with a
+	// single LDRB (Cortex-M0+ immediate offsets reach only 31 bytes). Reservations
+	// off: an empty type that, with [[no_unique_address]], occupies no storage -
+	// buffer keeps its offset and the object its size.
+	[[no_unique_address]] ResState<max_reservations> res;
 	alignas(alignof(T)) element_type buffer[Size];
 
 	// Compiler barriers ordering element accesses against the index accesses.
@@ -603,11 +781,119 @@ class RingBuffer_PackedState
 		}
 	}
 
+	// Under ProducerGuard. n must fit (caller checked free space and table).
+	RB_OPT_INLINE constexpr uint8_t res_alloc(uint16_t r, size_t n) {
+		uint8_t slot = static_cast<uint8_t>((res.first + res.count) & (max_reservations - 1));
+		res.reserved  = static_cast<uint16_t>(wrapSize(r + static_cast<uint32_t>(n)));
+		res.end[slot] = res.reserved;
+		res.done      = static_cast<uint8_t>(res.done & ~(1u << slot));
+		++res.count;
+		return slot;
+	}
+	// Under ProducerGuard. Marks `slot` done and tidies the table from both ends:
+	//  1. a finished entry at the YOUNG end is merged into its older neighbour
+	//     (which then ends where the merged one ended) and leaves the table - so
+	//     reserve()+commit() behind a still open reservation costs no table entry;
+	//  2. finished entries at the OLD end are released: the committed head is
+	//     published up to the end of the last one.
+	// A finished entry BETWEEN two open ones keeps its place until one of them
+	// finishes (the younger one's slot number cannot change). At most N steps each.
+	RB_OPT_INLINE constexpr void res_finish(uint8_t slot) {
+		release_barrier();                                   // every fill complete before anything is marked
+		uint8_t cnt = res.count;
+		if (cnt == 1) {                                      // the only entry (the usual case): publish it,
+			res.count  = 0;                                  // the table is empty again
+			state.head = res.end[slot];                      // single STRH
+			return;
+		}
+		// Several entries. At rest neither the oldest nor the youngest entry is
+		// marked done (a finished oldest is released, a finished youngest merged),
+		// so exactly one of three things happens:
+		const uint8_t mask  = static_cast<uint8_t>(max_reservations - 1);
+		uint8_t       first = res.first;
+		uint8_t       done  = res.done;
+		uint8_t       y     = static_cast<uint8_t>((first + cnt - 1) & mask);
+		if (slot == y) {
+			// 1. the youngest finished: merge it into its older neighbour - and that
+			//    one too if it was finished and waiting (wedged until now).
+			do {
+				uint8_t prev = static_cast<uint8_t>((y - 1) & mask);
+				res.end[prev] = res.end[y];
+				y = prev; --cnt;
+			} while (cnt > 1 && (done & (1u << y)) && ((done = static_cast<uint8_t>(done & ~(1u << y))), true));
+			res.done = done; res.count = cnt;
+		} else if (slot == first) {
+			// 2. the oldest finished: release it and every finished one behind it.
+			uint16_t h;
+			do {
+				h     = res.end[first];
+				done  = static_cast<uint8_t>(done & ~(1u << first));
+				first = static_cast<uint8_t>((first + 1) & mask);
+				--cnt;
+			} while (done & (1u << first));                  // the youngest is never done: stops in time
+			res.done = done; res.first = first; res.count = cnt;
+			state.head = h;                                  // single STRH: publish
+		} else {
+			// 3. one in the middle finished: it waits, wedged between two open ones.
+			res.done = static_cast<uint8_t>(done | (1u << slot));
+		}
+	}
+	// Under ProducerGuard, res.count != 0. Appends n elements that are already
+	// written to the youngest table entry (open or finished): they are published
+	// together with it. Takes no table entry, so it cannot be refused by the table.
+	RB_OPT_INLINE constexpr void res_extend(size_t n) {
+		release_barrier();
+		res.reserved = static_cast<uint16_t>(wrapSize(res.reserved + static_cast<uint32_t>(n)));
+		res.end[(res.first + res.count - 1) & (max_reservations - 1)] = res.reserved;
+	}
+
+	// Slow paths of push()/push_n() while a reservation is open: the data is
+	// complete as soon as it is written, so it is simply appended to the youngest
+	// table entry and published with it - never ahead of an unfinished
+	// reservation, and limited by free space only. Called with ProducerGuard
+	// already held (no nested locking). Out of line: see RB_OPT_COLD.
+	// item by value: a reference would force push() to keep the element in memory
+	// (address escapes into the out-of-line call) even on the fast path.
+	RB_OPT_COLD constexpr bool push_behind_reservations(T item, uint32_t tail) {
+		uint16_t r = res.reserved;
+		if (nextIndex(r) == tail) return false;
+		acquire_barrier();
+		buffer[r] = item;
+		res_extend(1);
+		return true;
+	}
+	RB_OPT_COLD constexpr size_t push_n_behind_reservations(const T* ptr, size_t count, uint32_t tail) {
+		uint16_t r = res.reserved;
+		size_t free_r = wrapSize(tail + Size - (uint32_t)r - 1);
+		if (count > free_r) count = free_r;
+		if (count == 0) return 0;
+		size_t first_r = Size - r;
+		if (first_r > count) first_r = count;
+		acquire_barrier();
+		if (copy_with_memcpy(count)) {
+			copy_memcpy(&buffer[r], ptr,           first_r);
+			copy_memcpy(&buffer[0], ptr + first_r, count - first_r);
+		} else {
+			copy_loop(&buffer[r], ptr,           first_r);
+			copy_loop(&buffer[0], ptr + first_r, count - first_r);
+		}
+		res_extend(count);                                   // may wrap: the end index wraps too
+		return count;
+	}
+
 	public:
 	using value_type = T;
 	static constexpr size_t capacity = Size - 1;
 
-	constexpr RingBuffer_PackedState() : state{}, buffer{}
+	// Returned by reserve(): write `count` elements to `ptr`, then commit().
+	// count == 0: refused (buffer full or max_reservations already open).
+	struct Reservation {
+		T*       ptr;
+		uint16_t count;
+		uint8_t  slot;               // internal
+	};
+
+	constexpr RingBuffer_PackedState() : state{}, res{}, buffer{}
 	{
 		if constexpr (std::is_same_v<IrqPolicy, Topology::Unspecified_<>>)
 			RingBuffer_PackedState_topology_not_specified<IrqPolicy>();
@@ -621,12 +907,32 @@ class RingBuffer_PackedState
 			// instantiated (the class is complete then), not when the template is parsed.
 			using test_type = RingBuffer_PackedState<std::conditional_t<std::is_void_v<T>, T, uint8_t>, 4, Topology::None<>, true>;
 			static_assert(unit_test_ringbuffer<test_type>::run_test(), "RingBuffer_PackedState unit test failed!");
+			// Reservation tests only where reservations are enabled - no compile
+			// time for anybody else.
+			if constexpr (max_reservations != 0) {
+				using res_test_type = RingBuffer_PackedState<std::conditional_t<std::is_void_v<T>, T, uint8_t>, 8,   // uint8_t: as test_type
+					RingBuffer_PackedState_ConstexprReservationTestPolicy, true>;
+				static_assert(unit_test_reservations<res_test_type>::run_test(),
+				              "RingBuffer_PackedState reservation unit test failed!");
+			}
 		}
 	}
 
 	RB_OPT_INLINE constexpr bool push(const T& item) {
 		ProducerGuard g;
 		auto s          = readHT();
+		if constexpr (max_reservations != 0) {
+			if (res.count == 0) [[likely]] {             // no reservation open: fast path
+				uint16_t next_h = nextIndex(s.head);
+				if (next_h == s.tail) [[unlikely]] return false;
+				acquire_barrier();
+				buffer[s.head] = item;
+				release_barrier();
+				state.head   = next_h;                   // single STRH
+				return true;
+			}
+			return push_behind_reservations(item, s.tail);   // older reservation open: slow
+		}                                                // path out of line, same lock
 		uint16_t next_h = nextIndex(s.head);
 		if (next_h == s.tail) [[unlikely]] return false; // full
 		acquire_barrier();
@@ -677,6 +983,10 @@ class RingBuffer_PackedState
 	RB_OPT_COPY constexpr size_t push_n(const T* ptr, size_t count) {
 		ProducerGuard g;
 		auto [h, t] = readHT();
+		if constexpr (max_reservations != 0) {
+			if (res.count != 0) [[unlikely]]             // older reservation open: as push()
+				return push_n_behind_reservations(ptr, count, t);
+		}
 		size_t available = wrapSize((uint32_t)t + Size - (uint32_t)h - 1);
 		if (count > available) count = available;
 		size_t first = Size - h;
@@ -746,9 +1056,15 @@ class RingBuffer_PackedState
 	//          corrupts the count. No lock inside clear() can prevent this,
 	//          because the unguarded side never takes the lock.
 	// Not safe while DMA is active on the buffer; stop the DMA first.
+	// With reservations enabled: no reservation may be open (its owner would
+	// later commit into the reset table).
 	RB_OPT_INLINE constexpr void clear() {
-		if (RB_IS_CONSTANT_EVALUATED()) { state.head = 0; state.tail = 0; return; }
+		if (RB_IS_CONSTANT_EVALUATED()) {
+			if constexpr (max_reservations != 0) res = ResState<max_reservations>{};
+			state.head = 0; state.tail = 0; return;
+		}
 		ClearGuard g;
+		if constexpr (max_reservations != 0) res = ResState<max_reservations>{};   // under the lock
 		release_barrier();   // finish element accesses before slots are handed back
 		typedef uint32_t __attribute__((may_alias)) u32_alias;
 		if constexpr (IrqPolicy::needs_volatile)
@@ -783,6 +1099,8 @@ class RingBuffer_PackedState
 	// before the buffer wraps. Call commit_push() after writing.
 	// NOTE: reads state without a Guard — only one producer may call this at a time.
 	RB_OPT_INLINE constexpr ContiguousArea get_contiguous_push_area(size_t max_size) {
+		static_assert(max_reservations == 0, "RingBuffer_PackedState: with reservations enabled use "
+		              "reserve()/commit() - get_contiguous_push_area()/commit_push() bypass the reservation table");
 		auto [h, t] = readHT();
 		size_t   available = wrapSize((uint32_t)t + Size - (uint32_t)h - 1);
 		size_t   contiguous = Size - h;
@@ -794,6 +1112,8 @@ class RingBuffer_PackedState
 
 	// Advances head by count after a contiguous push
 	RB_OPT_INLINE constexpr void commit_push(size_t count) {
+		static_assert(max_reservations == 0, "RingBuffer_PackedState: with reservations enabled use "
+		              "reserve()/commit() - get_contiguous_push_area()/commit_push() bypass the reservation table");
 		ProducerGuard g;
 		auto [h, t] = readHT();
 		size_t   available = wrapSize((uint32_t)t + Size - (uint32_t)h - 1);
@@ -837,7 +1157,14 @@ class RingBuffer_PackedState
 
 	// Reserves up to max_size contiguous push slots, advances head immediately,
 	// and returns pointer + count. Write to ptr after the call — no commit needed.
+	// CAUTION: the head is published BEFORE the data is written, so a consumer
+	// running concurrently can read the slots too early. Only safe while the
+	// consumer cannot run (e.g. its ISR disabled until the data is complete).
+	// For concurrent producers that fill outside the lock use the reservation
+	// API instead: Topology::MPSC/MPMC<Lock, N> with reserve() + commit().
 	RB_OPT constexpr ContiguousArea reserve_push(size_t max_size) {
+		static_assert(max_reservations == 0, "RingBuffer_PackedState: with reservations enabled use "
+		              "reserve()/commit() - reserve_push() publishes before the data is written");
 		ProducerGuard g;
 		auto [h, t] = readHT();
 		size_t   available  = wrapSize((uint32_t)t + Size - (uint32_t)h - 1);
@@ -856,6 +1183,9 @@ class RingBuffer_PackedState
 
 	// Reserves up to max_size contiguous pop slots, advances tail immediately,
 	// and returns pointer + count. Read from ptr after the call — no commit needed.
+	// CAUTION: the tail is published BEFORE the data is read, so a producer
+	// running concurrently can overwrite the slots while they are still being
+	// read. Only safe while the producer cannot run.
 	RB_OPT constexpr ConstContiguousArea reserve_pop(size_t max_size) {
 		ConsumerGuard g;
 		auto [h, t] = readHT();
@@ -872,10 +1202,89 @@ class RingBuffer_PackedState
 		state.tail = t;                                      // single STRH
 		return { ptr, contiguous };
 	}
+
+	// ---- producer reservations: Topology::MPSC/MPMC<Lock, N>, N = 1, 2, 4, 8 ----
+	//
+	// reserve(max): hands out up to max CONTIGUOUS free slots (stops at the array
+	//   end, like get_contiguous_push_area). Returns count == 0 when the buffer is
+	//   full or the reservation table is full - nothing waits.
+	// Fill r.ptr[0 .. r.count) in any context, outside any lock (copy, DMA), then
+	// commit(r): the data becomes visible once every OLDER reservation is
+	// committed too; reservations may finish in any order.
+	// commit(r, used): as commit(r), but publishes only the first `used` elements
+	//   when the block can still shrink - see there.
+	// push()/push_n() keep working: behind an open reservation they queue up after
+	// it, take no table entry and are limited by free space only.
+	// The table has N entries. An entry is taken by every open reservation, and by
+	// a finished one for as long as an OLDER and a YOUNGER reservation are both
+	// still open (it is wedged between them). With up to N reservations open at
+	// the same time reserve() is therefore never refused by the table as long as
+	// they are committed youngest-first or oldest-first (e.g. nested ISRs);
+	// committing one in the middle first can cost an entry until a neighbour ends.
+	// Contract: every non-empty reservation must be committed exactly once; an
+	// uncommitted one holds back everything reserved after it. Do not clear()
+	// while a reservation is open. Neither is detected: a second commit, or one
+	// after clear(), can publish another producer's unfinished reservation.
+	// isFull()/getSpace() count committed data only; producers should rely on the
+	// return values of reserve()/push()/push_n().
+	RB_OPT constexpr Reservation reserve(size_t max_size) {
+		static_assert(max_reservations != 0, "RingBuffer_PackedState: reserve()/commit() need reservations "
+		              "enabled - Topology::MPSC<PrimaskLock, N> or MPMC<PrimaskLock, N>, N = 1, 2, 4 or 8");
+		ProducerGuard g;
+		auto [h, t] = readHT();
+		// res.reserved is only maintained while a reservation is open; with none
+		// open the next free slot is the committed head (saves push() a store).
+		uint16_t r = (res.count != 0) ? res.reserved : h;
+		size_t free_r = wrapSize((uint32_t)t + Size - (uint32_t)r - 1);
+		size_t n = Size - r;                                 // contiguous to the array end
+		if (n > free_r)   n = free_r;
+		if (n > max_size) n = max_size;
+		if (n == 0 || res.count == max_reservations) return { nullptr, 0, 0 };
+		uint8_t slot = res_alloc(r, n);
+		acquire_barrier();                                   // caller's writes stay after this
+		return { &buffer[r], static_cast<uint16_t>(n), slot };
+	}
+
+	RB_OPT constexpr void commit(const Reservation& rv) {
+		static_assert(max_reservations != 0, "RingBuffer_PackedState: reserve()/commit() need reservations "
+		              "enabled - Topology::MPSC<PrimaskLock, N> or MPMC<PrimaskLock, N>, N = 1, 2, 4 or 8");
+		if (rv.count == 0) return;                           // refused reservation: nothing to do
+		ProducerGuard g;
+		res_finish(rv.slot);                                 // starts with the release barrier
+	}
+
+	// commit(r, used): finishes reservation r like commit(r), but publishes only
+	// its first `used` elements IF nothing has been reserved or pushed behind r in
+	// the meantime - the rest goes back to the free space. Otherwise the slots
+	// behind r are taken, the block cannot shrink, and all r.count elements are
+	// published. Returns the number published (used, or r.count).
+	// The caller cannot know which case it gets (another producer may have come in
+	// between), so fill the unused tail with something the consumer can skip
+	// BEFORE the call. That fits framed data (padding, an empty record), not a raw
+	// byte stream. With a single producer nothing can come in between: it always
+	// shrinks. used = 0 gives the reservation back completely when it can.
+	RB_OPT constexpr size_t commit(const Reservation& rv, size_t used) {
+		static_assert(max_reservations != 0, "RingBuffer_PackedState: reserve()/commit() need reservations "
+		              "enabled - Topology::MPSC<PrimaskLock, N> or MPMC<PrimaskLock, N>, N = 1, 2, 4 or 8");
+		if (rv.count == 0) return 0;
+		ProducerGuard g;
+		size_t   n     = rv.count;
+		uint32_t start = static_cast<uint32_t>(rv.ptr - buffer);
+		// Nothing allocated behind r  <=>  the next free slot is still r's end. r is
+		// then the youngest table entry (res_finish leaves no empty entry behind).
+		if (used < n && res.reserved == wrapSize(start + static_cast<uint32_t>(n))) {
+			res.reserved     = static_cast<uint16_t>(wrapSize(start + static_cast<uint32_t>(used)));
+			res.end[rv.slot] = res.reserved;
+			n = used;
+		}
+		res_finish(rv.slot);
+		return n;
+	}
 };
 
 #undef RB_OPT
 #undef RB_OPT_INLINE
 #undef RB_OPT_COPY
+#undef RB_OPT_COLD
 #undef RB_IS_CONSTANT_EVALUATED
 #undef RB_ASSUME
