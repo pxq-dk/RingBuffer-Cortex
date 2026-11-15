@@ -585,8 +585,13 @@ class RingBuffer_PackedState
 	RB_OPT_INLINE static void copy_memcpy(T* d, const T* s, size_t n) {
 		// Callers clamp n to the buffer size; stating it lets GCC prove the length
 		// bound - otherwise -Wstringop-overflow fires on `count - first`.
-		RB_ASSUME(n <= Size);
-		if (n != 0) memcpy(d, s, n * sizeof(T));
+		// if constexpr: this function is instantiated for every T that uses
+		// push_n()/pop_n(), also where it is never called - and memcpy on a
+		// non-trivially-copyable T would warn (-Wclass-memaccess) even as dead code.
+		if constexpr (std::is_trivially_copyable_v<T>) {
+			RB_ASSUME(n <= Size);
+			if (n != 0) memcpy(d, s, n * sizeof(T));
+		}
 	}
 
 	public:
@@ -599,7 +604,13 @@ class RingBuffer_PackedState
 			RingBuffer_PackedState_topology_not_specified<IrqPolicy>();
 		if constexpr (!_IsTestInstance)
 		{
-			using test_type = RingBuffer_PackedState<T, 4, Topology::None<>, true>;
+			// The test runs on uint8_t elements, not on T: what it checks is the index
+			// logic, which does not depend on the element type - and running it on T
+			// would demand that T can be built from and compared with integers, which
+			// ruled out structs, enums, pointers and bool. conditional_t only makes the
+			// type depend on T, so the assert is evaluated when the constructor is
+			// instantiated (the class is complete then), not when the template is parsed.
+			using test_type = RingBuffer_PackedState<std::conditional_t<std::is_void_v<T>, T, uint8_t>, 4, Topology::None<>, true>;
 			static_assert(unit_test_ringbuffer<test_type>::run_test(), "RingBuffer_PackedState unit test failed!");
 		}
 	}

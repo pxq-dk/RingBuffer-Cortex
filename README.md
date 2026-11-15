@@ -161,7 +161,7 @@ auto out = rb.reserve_pop(32);    // tail advances immediately
 
 | Parameter | Default | Description |
 |---|---|---|
-| `T` | — | Element type |
+| `T` | — | Element type. Any default-constructible, copy-assignable type: integers, `float`, `bool`, enums, pointers, structs. Types that are not trivially copyable (own copy constructor/assignment) work too — they are always copied element by element, never with `memcpy`. Not supported: types without a default constructor (all slots are constructed up front) and move-only types (`push` copies). |
 | `Size` | — | Total buffer slots. Effective capacity is `Size-1`. Must be in range [2, 65535]. |
 | `IrqPolicy` | none — **pass it explicitly** | IRQ protection policy. See [Choosing a topology](#choosing-a-topology) and [IRQ Protection Policies](#irq-protection-policies) below. Omitting it still means `None` but is deprecated since 1.4.0 (compiler warning) and becomes an error in 2.0. |
 
@@ -288,7 +288,7 @@ Distinguishing full from empty without a separate count variable. If `head == ta
 
 **Why compile-time unit tests?**
 
-A `static_assert` in the constructor runs `unit_test_ringbuffer::run_test()` at compile time against a `Size=4` test instance. If any test fails, the translation unit will not compile — no separate test binary required.
+A `static_assert` in the constructor runs `unit_test_ringbuffer::run_test()` at compile time against a `Size=4` test instance with `uint8_t` elements — it checks the index logic, which does not depend on the element type. If any test fails, the translation unit will not compile — no separate test binary required.
 
 ---
 
@@ -296,6 +296,7 @@ A `static_assert` in the constructor runs `unit_test_ringbuffer::run_test()` at 
 
 - **Fix — `push_n`/`pop_n` regression for larger blocks.** 1.4.0 replaced `memcpy` with a plain element loop everywhere. On a Cortex-M33 with an optimised `memcpy` that loop loses from about 8 elements on (64 bytes: 366 vs 126 cycles). Now a hybrid: short blocks keep the element loop — no call overhead, the common small-block case stays fast — and longer blocks use `memcpy` where it was measured to be faster. The limit is chosen automatically from the core, the C library and the element size (see [How `push_n` / `pop_n` copy](#how-push_n--pop_n-copy)); with newlib-nano, and on Cortex-M0/M0+, the behaviour of 1.4.0 is unchanged.
 - **Correction of the 1.4.0 rationale.** 1.4.0 dropped `memcpy` because "newlib-nano `memcpy` is a byte loop too". True for newlib-nano, and for the full newlib of GNU Tools for STM32 11.3 as well — but the full newlib of 14.3 and other C libraries ship an optimised `memcpy`.
+- **Fix — element types.** A buffer could only hold types that can be built from and compared with an integer, because the compile-time test ran on the element type: structs, enums and pointers did not compile, and `bool` failed the `static_assert`. The test now runs on `uint8_t`; any default-constructible, copy-assignable type works.
 - New optional configuration: `RB_COPY_LOOP_MAX` (see [Configuration](#configuration-optional-define-before-the-include)).
 
 ---
